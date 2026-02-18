@@ -1,4 +1,4 @@
-name: Compile Kernel from Source
+name: Compile Kernel from Source (Pixel 6 / A14 / BT500)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             repo git curl unzip zip python3 \
-            build-essential gcc g++ binutils \
+            build-essential gcc g++ \
             bc bison flex rsync \
             libssl-dev libelf-dev dwarves \
             ca-certificates
@@ -43,7 +43,8 @@ jobs:
           mkdir -p android-kernel
           cd android-kernel
           repo init -u https://android.googlesource.com/kernel/manifest -b android-gs-raviole-5.10-android14
-          repo sync -c --no-tags -j4 --fail-fast --force-sync --no-clone-bundle
+          export REPO="$(pwd)/.repo/repo/repo"
+          "${REPO}" sync -c --no-tags -j4 --fail-fast --force-sync --no-clone-bundle
 
       - name: Force-enable BT USB (ASUS BT500) in defconfig
         shell: bash
@@ -69,7 +70,7 @@ jobs:
           grep -q '^CONFIG_USB_SUPPORT=' "${DEF}" || echo 'CONFIG_USB_SUPPORT=y' >> "${DEF}"
 
           echo "----- tail ${DEF} -----"
-          tail -n 60 "${DEF}"
+          tail -n 80 "${DEF}"
 
       - name: Update vendor ramdisk (from factory zip)
         shell: bash
@@ -97,10 +98,9 @@ jobs:
           set -x
           cd android-kernel
 
-          # Prevent C23 headers mapping strtol->__isoc23_strtol for host tools (resolve_btfids)
+          # Force host tools (resolve_btfids) to build with GCC and avoid C23 __isoc23_* symbols
           export HOSTCC=gcc
           export HOSTCXX=g++
-          export HOSTLD=ld.bfd
           export HOSTCFLAGS="-std=gnu11"
           export HOSTCXXFLAGS="-std=gnu++17"
 
