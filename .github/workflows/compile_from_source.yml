@@ -151,115 +151,112 @@ jobs:
           mkdir -p "${RAMDISKS}"
 
           python3 - <<'PY'
-import os, sys, subprocess, shutil, pathlib
-
-TOP = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel")
-VENDOR_BOOT = TOP / "prebuilts" / "vendor_boot-oriole.img"
-OUTDIR = TOP / "vendor_boot_out"
-RAMDISKS = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks")
-DEVICE = os.environ.get("DEVICE", "oriole")
-
-RAMDISKS.mkdir(parents=True, exist_ok=True)
-OUTDIR.mkdir(parents=True, exist_ok=True)
-
-unpack = TOP / "android-kernel" / "build" / "kernel" / "build-tools" / "path" / "linux-x86" / "unpack_bootimg"
-if not unpack.exists():
-    alt = shutil.which("unpack_bootimg")
-    if not alt:
-        print("ERROR: unpack_bootimg not found (build-tools/path or PATH).", file=sys.stderr)
-        sys.exit(1)
-    unpack = pathlib.Path(alt)
-
-subprocess.check_call([str(unpack), "--boot_img", str(VENDOR_BOOT), "--out", str(OUTDIR)])
-
-byname = OUTDIR / "vendor-ramdisk-by-name"
-if not byname.exists():
-    print(f"ERROR: expected {byname} not found after unpack.", file=sys.stderr)
-    sys.exit(1)
-
-cands = sorted([p for p in byname.iterdir() if p.is_file() and p.name.startswith("ramdisk")])
-if not cands:
-    print(f"ERROR: no vendor ramdisk blobs found in {byname}", file=sys.stderr)
-    sys.exit(1)
-
-src = cands[0]
-dst = RAMDISKS / f"vendor_ramdisk-{DEVICE}.img"
-
-# Ensure dst is a REAL FILE (not symlink), so downstream scripts won't choke
-if dst.exists() or dst.is_symlink():
-    dst.unlink()
-shutil.copy2(src, dst)
-
-# Symlink expected convenience names
-top_link = RAMDISKS / f"{DEVICE}.img"
-if top_link.exists() or top_link.is_symlink():
-    top_link.unlink()
-top_link.symlink_to(dst.name)  # link within same dir
-
-nested = RAMDISKS / "vendor_ramdisk"
-nested.mkdir(parents=True, exist_ok=True)
-nested_link = nested / f"{DEVICE}.img"
-if nested_link.exists() or nested_link.is_symlink():
-    nested_link.unlink()
-nested_link.symlink_to(pathlib.Path("..") / dst.name)
-
-print("ramdisks dir:")
-subprocess.check_call(["/usr/bin/ls", "-al", str(RAMDISKS)])
-print("vendor_ramdisk dir:")
-subprocess.check_call(["/usr/bin/ls", "-al", str(nested)])
-PY
-
-          # Fail only if NONE of the expected locations exist (robust)
-          FOUND=0
-          for p in \
-            "${RAMDISK_DIR}/vendor_ramdisk-${DEVICE}.img" \
-            "${RAMDISK_DIR}/${DEVICE}.img" \
-            "${RAMDISK_DIR}/vendor_ramdisk/${DEVICE}.img"
-          do
-            if [ -e "${p}" ]; then
-              echo "OK: found ${p}"
-              FOUND=1
-            else
-              echo "MISS: ${p}"
-            fi
-          done
-
-          if [ "${FOUND}" -ne 1 ]; then
-            echo "ERROR: vendor ramdisk not found in any expected location." >&2
-            exit 1
-          fi
-
-      - name: Build (force host tools to use system gcc/binutils)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${KERNEL_TOP}"
-
-          export HOSTCC=/usr/bin/gcc
-          export HOSTCXX=/usr/bin/g++
-          export HOSTLD=/usr/bin/ld.bfd
-          export HOSTCFLAGS="-std=gnu11"
-          export HOSTCXXFLAGS="-std=gnu++17"
-
-          ./build_slider.sh | tee /tmp/build.log
-
-      - name: Collect dist output
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${KERNEL_TOP}"
-          echo "dist:"
-          ls -al "${KERNEL_TOP}/out/mixed/dist" || true
-          echo "last 200 lines build.log:"
-          tail -n 200 /tmp/build.log || true
-
-      - name: Upload dist artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist-${{ env.DEVICE }}
-          path: |
-            android-kernel/out/mixed/dist/**
-            /tmp/build.log
-          if-no-files-found: warn
+          import os, sys, subprocess, shutil, pathlib
+          
+          TOP = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel")
+          VENDOR_BOOT = TOP / "prebuilts" / "vendor_boot-oriole.img"
+          OUTDIR = TOP / "vendor_boot_out"
+          RAMDISKS = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks")
+          DEVICE = os.environ.get("DEVICE", "oriole")
+          
+          RAMDISKS.mkdir(parents=True, exist_ok=True)
+          OUTDIR.mkdir(parents=True, exist_ok=True)
+          
+          unpack = TOP / "android-kernel" / "build" / "kernel" / "build-tools" / "path" / "linux-x86" / "unpack_bootimg"
+          if not unpack.exists():
+              alt = shutil.which("unpack_bootimg")
+              if not alt:
+                  print("ERROR: unpack_bootimg not found (build-tools/path or PATH).", file=sys.stderr)
+                  sys.exit(1)
+              unpack = pathlib.Path(alt)
+          
+          subprocess.check_call([str(unpack), "--boot_img", str(VENDOR_BOOT), "--out", str(OUTDIR)])
+          
+          byname = OUTDIR / "vendor-ramdisk-by-name"
+          if not byname.exists():
+              print(f"ERROR: expected {byname} not found after unpack.", file=sys.stderr)
+              sys.exit(1)
+          
+          cands = sorted([p for p in byname.iterdir() if p.is_file() and p.name.startswith("ramdisk")])
+          if not cands:
+              print(f"ERROR: no vendor ramdisk blobs found in {byname}", file=sys.stderr)
+              sys.exit(1)
+          
+          src = cands[0]
+          dst = RAMDISKS / f"vendor_ramdisk-{DEVICE}.img"
+          
+          if dst.exists() or dst.is_symlink():
+              dst.unlink()
+          shutil.copy2(src, dst)
+          
+          top_link = RAMDISKS / f"{DEVICE}.img"
+          if top_link.exists() or top_link.is_symlink():
+              top_link.unlink()
+          top_link.symlink_to(dst.name)
+          
+          nested = RAMDISKS / "vendor_ramdisk"
+          nested.mkdir(parents=True, exist_ok=True)
+          nested_link = nested / f"{DEVICE}.img"
+          if nested_link.exists() or nested_link.is_symlink():
+              nested_link.unlink()
+          nested_link.symlink_to(pathlib.Path("..") / dst.name)
+          
+          print("ramdisks dir:")
+          subprocess.check_call(["/usr/bin/ls", "-al", str(RAMDISKS)])
+          print("vendor_ramdisk dir:")
+          subprocess.check_call(["/usr/bin/ls", "-al", str(nested)])
+          PY
+          
+                    FOUND=0
+                    for p in \
+                      "${RAMDISK_DIR}/vendor_ramdisk-${DEVICE}.img" \
+                      "${RAMDISK_DIR}/${DEVICE}.img" \
+                      "${RAMDISK_DIR}/vendor_ramdisk/${DEVICE}.img"
+                    do
+                      if [ -e "${p}" ]; then
+                        echo "OK: found ${p}"
+                        FOUND=1
+                      else
+                        echo "MISS: ${p}"
+                      fi
+                    done
+          
+                    if [ "${FOUND}" -ne 1 ]; then
+                      echo "ERROR: vendor ramdisk not found in any expected location." >&2
+                      exit 1
+                    fi
+          
+                - name: Build (force host tools to use system gcc/binutils)
+                  shell: bash
+                  run: |
+                    set -euo pipefail
+                    cd "${KERNEL_TOP}"
+          
+                    export HOSTCC=/usr/bin/gcc
+                    export HOSTCXX=/usr/bin/g++
+                    export HOSTLD=/usr/bin/ld.bfd
+                    export HOSTCFLAGS="-std=gnu11"
+                    export HOSTCXXFLAGS="-std=gnu++17"
+          
+                    ./build_slider.sh | tee /tmp/build.log
+          
+                - name: Collect dist output
+                  if: always()
+                  shell: bash
+                  run: |
+                    set -euo pipefail
+                    cd "${KERNEL_TOP}"
+                    echo "dist:"
+                    ls -al "${KERNEL_TOP}/out/mixed/dist" || true
+                    echo "last 200 lines build.log:"
+                    tail -n 200 /tmp/build.log || true
+          
+                - name: Upload dist artifacts
+                  if: always()
+                  uses: actions/upload-artifact@v4
+                  with:
+                    name: dist-${{ env.DEVICE }}
+                    path: |
+                      android-kernel/out/mixed/dist/**
+                      /tmp/build.log
+                    if-no-files-found: warn
