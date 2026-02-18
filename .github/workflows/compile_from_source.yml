@@ -101,8 +101,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          set -x
           cd android-kernel
-          BUILD_AOSP_KERNEL=1 ./build_slider.sh
+          BUILD_AOSP_KERNEL=1 ./build_slider.sh 2>&1 | tee /tmp/build.log
+
 
       - name: Pack images to upload
         shell: bash
