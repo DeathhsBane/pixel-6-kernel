@@ -3,7 +3,7 @@ name: compile_from_source
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
       - ".github/workflows/compile_from_source.yml"
 
@@ -17,10 +17,10 @@ jobs:
     timeout-minutes: 360
 
     env:
-      KERNEL_BRANCH: android14-gs-pixel-6.1
       DEVICE: oriole
-      KERNEL_DIR: android-kernel
+      KERNEL_BRANCH: android14-gs-pixel-6.1
       MANIFEST_URL: https://android.googlesource.com/kernel/manifest
+      BUILD_CONFIG: common/build.config.gki.aarch64
 
     steps:
       - name: Checkout
@@ -34,37 +34,9 @@ jobs:
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            ca-certificates \
-            ccache \
-            clang \
-            cpio \
-            curl \
-            flex \
-            file \
-            git \
-            libelf-dev \
-            libncurses-dev \
-            libssl-dev \
-            lld \
-            llvm \
-            lz4 \
-            make \
-            ninja-build \
-            openssl \
-            pahole \
-            pkg-config \
-            python3 \
-            python3-pip \
-            rsync \
-            unzip \
-            xz-utils \
-            zstd
-          clang --version
-          ld.lld --version || true
-          /usr/bin/ccache -V || true
+            bc bison build-essential ca-certificates clang cpio curl flex gcc g++ git \
+            lld llvm make ninja-build openssl pahole pkg-config python3 python3-pip \
+            rsync unzip xz-utils zstd binutils binutils-dev file lz4 ccache libelf-dev
 
       - name: Install repo tool
         shell: bash
@@ -75,22 +47,23 @@ jobs:
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo checkout
+      - name: Cache repo + out
         uses: actions/cache@v4
         with:
           path: |
             android-kernel/.repo
-          key: repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
+            android-kernel/out
+          key: pixel6-kernel-${{ runner.os }}-${{ env.KERNEL_BRANCH }}
           restore-keys: |
-            repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
+            pixel6-kernel-${{ runner.os }}-
 
       - name: repo init + sync
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p "${KERNEL_DIR}"
-          cd "${KERNEL_DIR}"
+          mkdir -p "${GITHUB_WORKSPACE}/android-kernel"
+          cd "${GITHUB_WORKSPACE}/android-kernel"
 
           if [ ! -d ".repo" ]; then
             /usr/local/bin/repo init -u "${MANIFEST_URL}" -b "${KERNEL_BRANCH}"
@@ -105,76 +78,90 @@ jobs:
             --optimized-fetch \
             --prune
 
-      - name: Patch gki_defconfig (BT USB)
+      - name: Patch gki_defconfig (idempotent)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${KERNEL_DIR}"
+          cd "${GITHUB_WORKSPACE}/android-kernel"
 
-          DEFCONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
-          if [ ! -f "${DEFCONFIG_PATH}" ]; then
-            echo "ERROR: expected defconfig not found: ${DEFCONFIG_PATH}" >&2
-            /usr/bin/find . -maxdepth 5 -name "gki_defconfig" -print || true
-            exit 1
-          fi
+          DEFCONFIG="./common/arch/arm64/configs/gki_defconfig"
+          test -f "${DEFCONFIG}"
 
-          append_once () {
+          ensure_line() {
             local line="$1"
-            local file="$2"
-            if ! /usr/bin/grep -qxF "${line}" "${file}"; then
-              echo "${line}" >> "${file}"
-            fi
+            grep -qxF "${line}" "${DEFCONFIG}" || echo "${line}" >> "${DEFCONFIG}"
           }
 
-          echo "" >> "${DEFCONFIG_PATH}"
-          append_once "CONFIG_BT=y" "${DEFCONFIG_PATH}"
-          append_once "CONFIG_BT_HCI=y" "${DEFCONFIG_PATH}"
-          append_once "CONFIG_BT_HCIBTUSB=y" "${DEFCONFIG_PATH}"
-          append_once "CONFIG_USB=y" "${DEFCONFIG_PATH}"
-          append_once "CONFIG_USB_SUPPORT=y" "${DEFCONFIG_PATH}"
+          ensure_line ""
+          ensure_line "CONFIG_BT_HCI=y"
+          ensure_line "CONFIG_BT_HCIBTUSB=y"
+          ensure_line "CONFIG_USB=y"
+          ensure_line "CONFIG_USB_SUPPORT=y"
 
-          echo "Patched tail:"
-          /usr/bin/tail -n 40 "${DEFCONFIG_PATH}"
+          echo "Tail of ${DEFCONFIG}:"
+          tail -n 40 "${DEFCONFIG}"
 
-      - name: Build (Bazel/Kleaf)
+      - name: Ensure vendor ramdisk file exists (use repo-root vendor_ramdisk00 if present)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${KERNEL_DIR}"
+          RAMDISK_DIR="${GITHUB_WORKSPACE}/android-kernel/prebuilts/boot-artifacts/ramdisks"
+          mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
 
-          if [ ! -x "./tools/bazel" ]; then
-            echo "ERROR: ./tools/bazel not found or not executable." >&2
-            echo "This tree should support Bazel/Kleaf for Android 14+." >&2
+          if [ -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
+            cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
+          fi
+
+          test -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
+
+          ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
+          ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+
+          ls -al "${RAMDISK_DIR}"
+          ls -al "${RAMDISK_DIR}/vendor_ramdisk"
+
+      - name: Build kernel (use real build.sh)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}/android-kernel"
+
+          BUILD_SH=""
+          if [ -x "./build/build.sh" ]; then
+            BUILD_SH="./build/build.sh"
+          elif [ -x "./build/kernel/build.sh" ]; then
+            BUILD_SH="./build/kernel/build.sh"
+          fi
+
+          if [ -z "${BUILD_SH}" ]; then
+            echo "ERROR: build.sh not found at ./build/build.sh or ./build/kernel/build.sh" >&2
+            find . -maxdepth 4 -type f -name "build.sh" -print || true
             exit 1
           fi
 
-          TARGET="//gs/google-modules/soc-modules:slider_dist"
-          if ! ./tools/bazel query "${TARGET}" >/dev/null 2>&1; then
-            echo "WARN: ${TARGET} not found; falling back to //common:kernel_aarch64_dist" >&2
-            TARGET="//common:kernel_aarch64_dist"
-          fi
+          echo "Using build script: ${BUILD_SH}"
+          echo "Using BUILD_CONFIG: ${BUILD_CONFIG}"
 
-          echo "Using Bazel target: ${TARGET}"
-          ./tools/bazel run "${TARGET}" 2>&1 | /usr/bin/tee /tmp/kernel-build.log
+          export BUILD_CONFIG="${BUILD_CONFIG}"
+          "${BUILD_SH}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
 
-          echo "Searching for dist dir..."
-          DIST_DIR="$(/usr/bin/find out -maxdepth 4 -type d -name dist -print -quit || true)"
-          if [ -z "${DIST_DIR}" ]; then
-            echo "ERROR: dist dir not found under ${KERNEL_DIR}/out" >&2
-            /usr/bin/find out -maxdepth 6 -type d -print | /usr/bin/head -n 200 || true
-            exit 1
-          fi
-
-          echo "DIST_DIR=${DIST_DIR}" >> "${GITHUB_ENV}"
-          echo "Dist dir: ${DIST_DIR}"
-          /usr/bin/ls -al "${DIST_DIR}" || true
+      - name: Collect outputs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Dist dirs:"
+          find "${GITHUB_WORKSPACE}/android-kernel/out" -type d -name "dist" -print || true
+          echo "Last 200 lines of build.log:"
+          tail -n 200 "${GITHUB_WORKSPACE}/build.log" || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-dist-${{ env.DEVICE }}
+          name: oriole-build
           path: |
-            android-kernel/${{ env.DIST_DIR }}/**
-            /tmp/kernel-build.log
+            android-kernel/out/**/dist/**
+            build.log
           if-no-files-found: warn
+
