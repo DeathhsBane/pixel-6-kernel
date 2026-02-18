@@ -1,20 +1,17 @@
-name: Pixel 6 Kernel (oriole) — fast, repeatable CI
+name: compile_from_source
 
 on:
   workflow_dispatch:
-    inputs:
-      factory_zip:
-        description: "Pixel 6 (oriole) factory zip filename (from Google factory images)"
-        required: true
-        default: "oriole-ap2a.240905.003.f1-factory-655c44e7.zip"
   push:
-    branches: [main]
+    branches: ["main"]
     paths:
-      - "android-kernel/**"
-      - ".github/workflows/pixel6-kernel.yml"
+      - ".github/workflows/compile_from_source.yml"
+      - "vendor_ramdisk00"
+      - "build_kali_nethunter.sh"
+      - "util_functions.sh"
 
 concurrency:
-  group: pixel6-kernel-${{ github.ref }}
+  group: compile-from-source-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,10 +21,9 @@ jobs:
 
     env:
       DEVICE: oriole
+      KERNEL_BRANCH: android14-gs-pixel-6.1
       KERNEL_TOP: ${{ github.workspace }}/android-kernel
       RAMDISK_DIR: ${{ github.workspace }}/android-kernel/prebuilts/boot-artifacts/ramdisks
-      PREBUILTS_DIR: ${{ github.workspace }}/prebuilts
-      FACTORY_BASE_URL: https://dl.google.com/dl/android/aosp
 
     steps:
       - name: Checkout
@@ -35,37 +31,33 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sanity check workspace (shows what actually exists)
+      - name: Sanity check repo contents
         shell: bash
         run: |
           set -euo pipefail
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
           /usr/bin/ls -al "${GITHUB_WORKSPACE}"
-          /usr/bin/find "${GITHUB_WORKSPACE}" -maxdepth 3 -type d -print
 
-          if [ ! -d "${KERNEL_TOP}" ]; then
-            echo "ERROR: Missing directory: ${KERNEL_TOP}" >&2
-            echo "Your repo must contain an 'android-kernel/' folder at the repo root (or adjust KERNEL_TOP)." >&2
+          if [ ! -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
+            echo "ERROR: Missing file: ${GITHUB_WORKSPACE}/vendor_ramdisk00" >&2
+            echo "Commit your extracted vendor ramdisk blob at repo root as: vendor_ramdisk00" >&2
             exit 1
           fi
 
-          /usr/bin/ls -al "${KERNEL_TOP}"
-
-      - name: Install build deps (binutils/ld.bfd + host toolchain)
+      - name: Install build deps (binutils/ld.bfd + toolchain)
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bash bc bison build-essential ca-certificates clang cpio curl flex \
-            gcc g++ git lld llvm make ninja-build openssl pahole pkg-config \
-            python3 python3-pip rsync unzip xz-utils zstd \
-            binutils binutils-dev file
+            bc bison build-essential ca-certificates clang cpio curl flex file git \
+            lld llvm lz4 make ninja-build openssl pahole pkg-config python3 python3-pip \
+            rsync unzip xz-utils zstd \
+            binutils binutils-dev libelf-dev libncurses-dev libssl-dev ccache
 
-          command -v /usr/bin/ld.bfd >/dev/null 2>&1
-          /usr/bin/ld.bfd --version | head -n 1 || true
+          command -v /usr/bin/ld.bfd >/dev/null 2>&1 || (echo "ERROR: /usr/bin/ld.bfd missing" >&2; exit 1)
 
-      - name: Install repo (writable launcher)
+      - name: Install repo tool (writable launcher)
         shell: bash
         run: |
           set -euo pipefail
@@ -74,27 +66,29 @@ jobs:
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo + out (speedup)
+      - name: Cache repo + out + ccache (best-effort speedup)
+        continue-on-error: true
         uses: actions/cache@v4
         with:
           path: |
             android-kernel/.repo
             android-kernel/out
-          key: pixel6-kernel-${{ runner.os }}-${{ env.DEVICE }}-${{ hashFiles('.github/workflows/pixel6-kernel.yml') }}
+            .ccache
+          key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
           restore-keys: |
-            pixel6-kernel-${{ runner.os }}-${{ env.DEVICE }}-
+            pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
 
-      - name: repo sync (fast flags)
+      - name: repo init + sync (creates android-kernel/)
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "${KERNEL_TOP}"
           cd "${KERNEL_TOP}"
 
-          if [ ! -d "${KERNEL_TOP}/.repo" ]; then
-            echo "ERROR: android-kernel/.repo missing." >&2
-            echo "You either need to commit your initialized repo state under android-kernel/ OR add a repo init step." >&2
-            exit 1
-          fi
+          /usr/local/bin/repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${KERNEL_BRANCH}" \
+            --depth=1
 
           /usr/local/bin/repo sync \
             -c \
@@ -105,7 +99,10 @@ jobs:
             --optimized-fetch \
             --prune
 
-      - name: Find + patch gki_defconfig (robust path)
+          echo "Kernel tree top-level:"
+          /usr/bin/ls -al "${KERNEL_TOP}"
+
+      - name: Find + patch gki_defconfig (robust)
         shell: bash
         run: |
           set -euo pipefail
@@ -115,141 +112,72 @@ jobs:
           DEFCONFIG_PATH="$(find ./aosp ./common -type f -path "*/arch/arm64/configs/gki_defconfig" -print -quit || true)"
           if [ -z "${DEFCONFIG_PATH}" ]; then
             echo "ERROR: gki_defconfig not found under ./aosp or ./common" >&2
-            find . -maxdepth 6 -type f -name "gki_defconfig" -print || true
+            find . -maxdepth 8 -type f -name "gki_defconfig" -print || true
             exit 1
           fi
           echo "Using defconfig: ${DEFCONFIG_PATH}"
 
-          {
-            echo ""
-            echo "CONFIG_BT_HCI=y"
-            echo "CONFIG_BT_HCIBTUSB=y"
-            echo "CONFIG_USB=y"
-            echo "CONFIG_USB_SUPPORT=y"
-          } >> "${DEFCONFIG_PATH}"
+          for line in \
+            "CONFIG_BT_HCI=y" \
+            "CONFIG_BT_HCIBTUSB=y" \
+            "CONFIG_USB=y" \
+            "CONFIG_USB_SUPPORT=y"
+          do
+            grep -qxF "${line}" "${DEFCONFIG_PATH}" || echo "${line}" >> "${DEFCONFIG_PATH}"
+          done
 
           echo "Patched tail of defconfig:"
           tail -n 40 "${DEFCONFIG_PATH}"
 
-      - name: Download factory zip + extract vendor_boot.img
+      - name: Provide vendor ramdisk (from repo root vendor_ramdisk00)
         shell: bash
         run: |
           set -euo pipefail
-          FACTORY_ZIP="${{ github.event.inputs.factory_zip }}"
-          FACTORY_ZIP="${FACTORY_ZIP:-oriole-ap2a.240905.003.f1-factory-655c44e7.zip}"
-          echo "Factory zip: ${FACTORY_ZIP}"
+          mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
 
-          mkdir -p "${PREBUILTS_DIR}"
-          cd "${PREBUILTS_DIR}"
+          cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
 
-          if [ ! -f "${FACTORY_ZIP}" ]; then
-            curl -fL --retry 5 --retry-delay 2 -o "${FACTORY_ZIP}" "${FACTORY_BASE_URL}/${FACTORY_ZIP}"
+          ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
+          ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+
+          echo "ramdisks:"
+          /usr/bin/ls -al "${RAMDISK_DIR}"
+          echo "ramdisks/vendor_ramdisk:"
+          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
+
+          test -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
+          test -e "${RAMDISK_DIR}/oriole.img"
+          test -e "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${KERNEL_TOP}"
+
+          export HOSTCC=/usr/bin/gcc
+          export HOSTCXX=/usr/bin/g++
+          export HOSTLD=/usr/bin/ld.bfd
+          export HOSTCFLAGS="-std=gnu11"
+          export HOSTCXXFLAGS="-std=gnu++17"
+
+          export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+          mkdir -p "${CCACHE_DIR}"
+
+          if [ -x "${KERNEL_TOP}/build_slider.sh" ]; then
+            ./build_slider.sh | tee "${GITHUB_WORKSPACE}/build.log"
+          elif [ -x "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" ]; then
+            /usr/bin/bash "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" | tee "${GITHUB_WORKSPACE}/build.log"
+          else
+            echo "ERROR: No build entrypoint found (expected build_slider.sh in kernel tree or build_kali_nethunter.sh in repo root)." >&2
+            exit 1
           fi
 
-          rm -f vendor_boot-oriole.img
-          unzip -p "${FACTORY_ZIP}" "vendor_boot.img" > vendor_boot-oriole.img
-
-          test -s vendor_boot-oriole.img
-          ls -al vendor_boot-oriole.img
-
-      - name: Prepare vendor ramdisk (create vendor_ramdisk-oriole.img)
+      - name: Collect dist output
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
-
-          python3 - <<'PY'
-          import os, sys, subprocess, shutil, pathlib
-          
-          WS = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
-          DEVICE = os.environ.get("DEVICE", "oriole")
-          KERNEL_TOP = WS / "android-kernel"
-          VENDOR_BOOT = WS / "prebuilts" / "vendor_boot-oriole.img"
-          OUTDIR = WS / "vendor_boot_out"
-          RAMDISKS = KERNEL_TOP / "prebuilts" / "boot-artifacts" / "ramdisks"
-          
-          RAMDISKS.mkdir(parents=True, exist_ok=True)
-          OUTDIR.mkdir(parents=True, exist_ok=True)
-          
-          unpack = KERNEL_TOP / "build" / "kernel" / "build-tools" / "path" / "linux-x86" / "unpack_bootimg"
-          if not unpack.exists():
-              alt = shutil.which("unpack_bootimg")
-              if not alt:
-                  print("ERROR: unpack_bootimg not found (build-tools/path or PATH).", file=sys.stderr)
-                  sys.exit(1)
-              unpack = pathlib.Path(alt)
-          
-          subprocess.check_call([str(unpack), "--boot_img", str(VENDOR_BOOT), "--out", str(OUTDIR)])
-          
-          byname = OUTDIR / "vendor-ramdisk-by-name"
-          if not byname.exists():
-              print(f"ERROR: expected {byname} not found after unpack.", file=sys.stderr)
-              sys.exit(1)
-          
-          cands = sorted([p for p in byname.iterdir() if p.is_file() and p.name.startswith("ramdisk")])
-          if not cands:
-              print(f"ERROR: no vendor ramdisk blobs found in {byname}", file=sys.stderr)
-              sys.exit(1)
-          
-          src = cands[0]
-          dst = RAMDISKS / f"vendor_ramdisk-{DEVICE}.img"
-          
-          if dst.exists() or dst.is_symlink():
-              dst.unlink()
-          shutil.copy2(src, dst)
-          
-          top_link = RAMDISKS / f"{DEVICE}.img"
-          if top_link.exists() or top_link.is_symlink():
-              top_link.unlink()
-          top_link.symlink_to(dst.name)
-          
-          nested = RAMDISKS / "vendor_ramdisk"
-          nested.mkdir(parents=True, exist_ok=True)
-          nested_link = nested / f"{DEVICE}.img"
-          if nested_link.exists() or nested_link.is_symlink():
-              nested_link.unlink()
-          nested_link.symlink_to(pathlib.Path("..") / dst.name)
-          
-          print("ramdisks dir:")
-          subprocess.check_call(["/usr/bin/ls", "-al", str(RAMDISKS)])
-          print("vendor_ramdisk dir:")
-          subprocess.check_call(["/usr/bin/ls", "-al", str(nested)])
-          PY
-          
-                    test -f "${RAMDISK_DIR}/vendor_ramdisk-${DEVICE}.img"
-                    test -e "${RAMDISK_DIR}/${DEVICE}.img"
-                    test -e "${RAMDISK_DIR}/vendor_ramdisk/${DEVICE}.img"
-          
-                - name: Build (force host tools to use system gcc/binutils)
-                  shell: bash
-                  run: |
-                    set -euo pipefail
-                    cd "${KERNEL_TOP}"
-          
-                    export HOSTCC=/usr/bin/gcc
-                    export HOSTCXX=/usr/bin/g++
-                    export HOSTLD=/usr/bin/ld.bfd
-                    export HOSTCFLAGS="-std=gnu11"
-                    export HOSTCXXFLAGS="-std=gnu++17"
-          
-                    ./build_slider.sh | tee /tmp/build.log
-          
-                - name: Collect dist output
-                  if: always()
-                  shell: bash
-                  run: |
-                    set -euo pipefail
-                    cd "${KERNEL_TOP}"
-                    echo "dist:"
-                    ls -al "${KERNEL_TOP}/out/mixed/dist" || true
-                    echo "last 200 lines build.log:"
-                    tail -n 200 /tmp/build.log || true
-          
-                - name: Upload dist artifacts
-                  if: always()
-                  uses: actions/upload-artifact@v4
-                  with:
-                    name: dist-${{ env.DEVICE }}
-                    path: |
-                      android-kernel/out/mixed/dist/**
-                      /tmp/build.log
-                    if-no-files-found: warn
+          echo "dist (if present):"
+          /usr/bin/ls -al "${KERNEL_TOP}/out" || true
+          find "${KERNEL_TOP}/out" -_
