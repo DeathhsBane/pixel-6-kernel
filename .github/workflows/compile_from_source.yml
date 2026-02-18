@@ -2,10 +2,6 @@ name: compile_from_source
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
-    paths:
-      - ".github/workflows/compile_from_source.yml"
 
 concurrency:
   group: compile_from_source-${{ github.ref }}
@@ -20,7 +16,6 @@ jobs:
       DEVICE: oriole
       KERNEL_BRANCH: android14-gs-pixel-6.1
       MANIFEST_URL: https://android.googlesource.com/kernel/manifest
-      BUILD_CONFIG: common/build.config.gki.aarch64
 
     steps:
       - name: Checkout
@@ -28,40 +23,60 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install build deps
+      - name: Install deps + repo
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ca-certificates clang cpio curl flex gcc g++ git \
-            lld llvm make ninja-build openssl pahole pkg-config python3 python3-pip \
-            rsync unzip xz-utils zstd binutils binutils-dev file lz4 ccache libelf-dev
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            ccache \
+            clang \
+            cpio \
+            curl \
+            file \
+            flex \
+            git \
+            lld \
+            llvm \
+            libelf-dev \
+            make \
+            ninja-build \
+            openssl \
+            pahole \
+            pkg-config \
+            python3 \
+            python3-pip \
+            rsync \
+            unzip \
+            xz-utils \
+            zstd \
+            binutils \
+            binutils-dev
 
-      - name: Install repo tool
-        shell: bash
-        run: |
-          set -euo pipefail
           sudo install -d -m 0755 /usr/local/bin
           sudo curl -fsSL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo + out
+      - name: Cache repo + out + ccache
         uses: actions/cache@v4
         with:
           path: |
             android-kernel/.repo
             android-kernel/out
-          key: pixel6-kernel-${{ runner.os }}-${{ env.KERNEL_BRANCH }}
+            .ccache
+          key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
           restore-keys: |
-            pixel6-kernel-${{ runner.os }}-
+            pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
 
       - name: repo init + sync
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "${GITHUB_WORKSPACE}/android-kernel"
           cd "${GITHUB_WORKSPACE}/android-kernel"
 
@@ -84,84 +99,104 @@ jobs:
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}/android-kernel"
 
-          DEFCONFIG="./common/arch/arm64/configs/gki_defconfig"
-          test -f "${DEFCONFIG}"
+          DEFCONFIG_PATH="$(find ./common -type f -path '*/arch/arm64/configs/gki_defconfig' -print -quit)"
+          if [ -z "${DEFCONFIG_PATH}" ]; then
+            echo "ERROR: gki_defconfig not found under ./common" >&2
+            exit 1
+          fi
+          echo "Using defconfig: ${DEFCONFIG_PATH}"
 
-          ensure_line() {
-            local line="$1"
-            grep -qxF "${line}" "${DEFCONFIG}" || echo "${line}" >> "${DEFCONFIG}"
+          ensure() {
+            local key="$1" val="$2" f="$3"
+            if grep -qE "^${key}=" "$f"; then
+              sed -i "s/^${key}=.*/${key}=${val}/" "$f"
+            else
+              printf '%s=%s\n' "$key" "$val" >> "$f"
+            fi
           }
 
-          ensure_line ""
-          ensure_line "CONFIG_BT_HCI=y"
-          ensure_line "CONFIG_BT_HCIBTUSB=y"
-          ensure_line "CONFIG_USB=y"
-          ensure_line "CONFIG_USB_SUPPORT=y"
+          ensure CONFIG_BT_HCI y "${DEFCONFIG_PATH}"
+          ensure CONFIG_BT_HCIBTUSB y "${DEFCONFIG_PATH}"
+          ensure CONFIG_USB y "${DEFCONFIG_PATH}"
+          ensure CONFIG_USB_SUPPORT y "${DEFCONFIG_PATH}"
 
-          echo "Tail of ${DEFCONFIG}:"
-          tail -n 40 "${DEFCONFIG}"
+          tail -n 40 "${DEFCONFIG_PATH}"
 
-      - name: Ensure vendor ramdisk file exists (use repo-root vendor_ramdisk00 if present)
+      - name: Prepare vendor ramdisk symlinks
         shell: bash
         run: |
           set -euo pipefail
+
           RAMDISK_DIR="${GITHUB_WORKSPACE}/android-kernel/prebuilts/boot-artifacts/ramdisks"
           mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
 
           if [ -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
             cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
+          elif [ -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img" ]; then
+            echo "Using existing ${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
+          else
+            echo "ERROR: missing vendor ramdisk source. Put vendor_ramdisk00 at repo root." >&2
+            exit 1
           fi
-
-          test -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
 
           ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
           ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
 
-          ls -al "${RAMDISK_DIR}"
-          ls -al "${RAMDISK_DIR}/vendor_ramdisk"
+          /usr/bin/ls -al "${RAMDISK_DIR}"
+          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
 
-      - name: Build kernel (use real build.sh)
+      - name: Build kernel (build/build.sh)
         shell: bash
         run: |
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}/android-kernel"
 
-          BUILD_SH=""
-          if [ -x "./build/build.sh" ]; then
-            BUILD_SH="./build/build.sh"
-          elif [ -x "./build/kernel/build.sh" ]; then
-            BUILD_SH="./build/kernel/build.sh"
+          mkdir -p "${GITHUB_WORKSPACE}/.ccache"
+          ccache --set-config=max_size=5.0G
+          export USE_CCACHE=1
+          export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+
+          # Your current failure is here: build/build.sh is missing or not executable in your synced tree.
+          # Fix: if missing, pull kernel/build and fill in missing top-level build scripts.
+          if [ ! -f "./build/build.sh" ]; then
+            echo "build/build.sh missing; pulling kernel/build to supply it..."
+            rm -rf /tmp/kernel-build
+            GIT_TERMINAL_PROMPT=0 git clone --depth=1 https://android.googlesource.com/kernel/build /tmp/kernel-build
+            mkdir -p ./build
+            rsync -a --ignore-existing /tmp/kernel-build/ ./build/
           fi
 
-          if [ -z "${BUILD_SH}" ]; then
-            echo "ERROR: build.sh not found at ./build/build.sh or ./build/kernel/build.sh" >&2
-            find . -maxdepth 4 -type f -name "build.sh" -print || true
+          if [ ! -f "./build/build.sh" ]; then
+            echo "ERROR: still no build/build.sh after fallback." >&2
+            echo "Contents of ./build:" >&2
+            /usr/bin/ls -al ./build >&2 || true
             exit 1
           fi
 
-          echo "Using build script: ${BUILD_SH}"
-          echo "Using BUILD_CONFIG: ${BUILD_CONFIG}"
+          if [ -f "./private/gs-google/build.config.slider" ]; then
+            export BUILD_CONFIG=private/gs-google/build.config.slider
+          elif [ -f "./common/build.config.gki.aarch64" ]; then
+            export BUILD_CONFIG=common/build.config.gki.aarch64
+          elif [ -f "./common/build.config.gki" ]; then
+            export BUILD_CONFIG=common/build.config.gki
+          else
+            echo "ERROR: no known BUILD_CONFIG found." >&2
+            find . -maxdepth 4 -type f -name "build.config*" -print | head -n 200 || true
+            exit 1
+          fi
 
-          export BUILD_CONFIG="${BUILD_CONFIG}"
-          "${BUILD_SH}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          export OUT_DIR="${GITHUB_WORKSPACE}/android-kernel/out"
+          export DIST_DIR="${GITHUB_WORKSPACE}/dist"
+          mkdir -p "${DIST_DIR}"
 
-      - name: Collect outputs
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Dist dirs:"
-          find "${GITHUB_WORKSPACE}/android-kernel/out" -type d -name "dist" -print || true
-          echo "Last 200 lines of build.log:"
-          tail -n 200 "${GITHUB_WORKSPACE}/build.log" || true
+          bash ./build/build.sh 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oriole-build
+          name: dist-${{ env.DEVICE }}
           path: |
-            android-kernel/out/**/dist/**
+            dist/**
             build.log
           if-no-files-found: warn
-
