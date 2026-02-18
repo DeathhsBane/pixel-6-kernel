@@ -96,7 +96,7 @@ jobs:
         run: |
           set -euo pipefail
           cd android-kernel
-          tools/bazel run --config=fast --config=stamp //private/google-modules/soc/gs:slider_dist
+          BUILD_AOSP_KERNEL=1 ./build_slider.sh
 
       - name: Pack images to upload
         shell: bash
