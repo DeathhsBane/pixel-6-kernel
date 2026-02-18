@@ -1,4 +1,4 @@
-name: Compile Kernel from Source (Pixel 6 / A14 / BT500)
+name: Compile Pixel 6 Kernel (BTUSB enabled)
 
 on:
   workflow_dispatch:
@@ -11,141 +11,133 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     env:
+      KERNEL_BRANCH: android14-gs-pixel-6.1
+      DEVICE: oriole
       FACTORY_IMAGE: oriole-ap2a.240905.003.f1
-      FACTORY_ZIP_URL: https://dl.google.com/dl/android/aosp/oriole-ap2a.240905.003.f1-factory-655c44e7.zip
+      FACTORY_ZIP: oriole-ap2a.240905.003.f1-factory-655c44e7.zip
 
     steps:
-      - name: Checkout Project
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Free up space
+      - name: Free disk space
         uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
 
-      - name: Install packages
-        shell: bash
+      - name: Install build dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            repo git curl unzip zip python3 \
-            build-essential gcc g++ \
-            bc bison flex rsync \
-            libssl-dev libelf-dev dwarves \
-            ca-certificates
+            git curl unzip zip python3 python3-pip \
+            build-essential bc bison flex \
+            libssl-dev libelf-dev libncurses-dev \
+            clang lld llvm \
+            binutils binutils-dev \
+            dwarves zstd xz-utils \
+            rsync ca-certificates
 
-      - name: Sync kernel repo (Pixel 6 raviole 5.10 Android 14)
-        shell: bash
+      - name: Install repo tool
+        run: |
+          set -euo pipefail
+          sudo curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod 0755 /usr/local/bin/repo
+          repo --version || true
+
+      - name: Sync kernel repo
         run: |
           set -euo pipefail
           mkdir -p android-kernel
           cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest -b android-gs-raviole-5.10-android14
-          export REPO="$(pwd)/.repo/repo/repo"
-          "${REPO}" sync -c --no-tags -j4 --fail-fast --force-sync --no-clone-bundle
+          repo init -u https://android.googlesource.com/kernel/manifest -b "${KERNEL_BRANCH}"
+          repo sync -c --no-tags --no-clone-bundle --optimized-fetch --prune -j"$(nproc)"
 
-      - name: Force-enable BT USB (ASUS BT500) in defconfig
-        shell: bash
+      - name: Patch config (BTUSB + USB)
         run: |
           set -euo pipefail
           cd android-kernel
+          CFG="aosp/arch/arm64/configs/gki_defconfig"
+          grep -q '^CONFIG_BT_HCI=y' "$CFG" || echo 'CONFIG_BT_HCI=y' >> "$CFG"
+          grep -q '^CONFIG_BT_HCIBTUSB=y' "$CFG" || echo 'CONFIG_BT_HCIBTUSB=y' >> "$CFG"
+          grep -q '^CONFIG_USB=y' "$CFG" || echo 'CONFIG_USB=y' >> "$CFG"
+          grep -q '^CONFIG_USB_SUPPORT=y' "$CFG" || echo 'CONFIG_USB_SUPPORT=y' >> "$CFG"
+          tail -n 20 "$CFG"
 
-          DEF="$(find . -type f -name gki_defconfig | head -n 1)"
-          if [ -z "${DEF}" ]; then
-            echo "ERROR: gki_defconfig not found" >&2
-            exit 1
-          fi
-
-          echo "[+] Using defconfig: ${DEF}"
-          cp -av "${DEF}" "${DEF}.bak"
-
-          grep -q '^CONFIG_BT=' "${DEF}" || echo 'CONFIG_BT=y' >> "${DEF}"
-          grep -q '^CONFIG_BT_HCI=' "${DEF}" || echo 'CONFIG_BT_HCI=y' >> "${DEF}"
-          grep -q '^CONFIG_BT_RFCOMM=' "${DEF}" || echo 'CONFIG_BT_RFCOMM=y' >> "${DEF}"
-          grep -q '^CONFIG_BT_HCIBTUSB=' "${DEF}" || echo 'CONFIG_BT_HCIBTUSB=y' >> "${DEF}"
-
-          grep -q '^CONFIG_USB=' "${DEF}" || echo 'CONFIG_USB=y' >> "${DEF}"
-          grep -q '^CONFIG_USB_SUPPORT=' "${DEF}" || echo 'CONFIG_USB_SUPPORT=y' >> "${DEF}"
-
-          echo "----- tail ${DEF} -----"
-          tail -n 80 "${DEF}"
-
-      - name: Update vendor ramdisk (from factory zip)
-        shell: bash
+      - name: Download factory image and extract vendor_boot
         run: |
           set -euo pipefail
-
-          # Download factory image
-          curl -fL -o factory.zip "${FACTORY_ZIP_URL}"
-          unzip -q factory.zip
-
-          # Extract vendor_boot.img
+          curl -L -o "${FACTORY_ZIP}" "https://dl.google.com/dl/android/aosp/${FACTORY_ZIP}"
+          unzip -q "${FACTORY_ZIP}"
           cd "${FACTORY_IMAGE}"
           unzip -q "image-${FACTORY_IMAGE}.zip" vendor_boot.img
           mv vendor_boot.img ..
           cd ..
 
-          # Unpack vendor_boot.img to get vendor ramdisk payload
-          android-kernel/tools/mkbootimg/unpack_bootimg.py --boot_img vendor_boot.img --out vendor_boot_out
+      - name: Extract vendor ramdisk and place where build expects it
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}"
 
-          RAMDISK_SRC="vendor_boot_out/vendor-ramdisk-by-name/ramdisk_"
-          if [ ! -f "${RAMDISK_SRC}" ]; then
-            echo "ERROR: vendor ramdisk not found at ${RAMDISK_SRC}" >&2
-            find vendor_boot_out -maxdepth 4 -type f | head -n 200
-            exit 1
-          fi
+          python3 android-kernel/tools/mkbootimg/unpack_bootimg.py \
+            --boot_img vendor_boot.img \
+            --out vendor_boot_out
 
-          # Put the ramdisk where different scripts expect it
+          # This is the actual vendor ramdisk blob produced by Google's vendor_boot
+          VENDOR_RAMDISK_SRC="vendor_boot_out/vendor-ramdisk-by-name/ramdisk_"
+
+          # Create all paths some scripts look for
           mkdir -p android-kernel/prebuilts/boot-artifacts/ramdisks
           mkdir -p android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk
 
-          cp -av "${RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
-          cp -av "${RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/oriole.img || true
-          cp -av "${RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk/oriole.img || true
+          # Canonical filename (the one your previous log complained about)
+          cp -f "${VENDOR_RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-${DEVICE}.img
 
-          ls -lah android-kernel/prebuilts/boot-artifacts/ramdisks || true
+          # Also provide alternate names/paths (some build scripts look for these)
+          ln -sf ../vendor_ramdisk-${DEVICE}.img android-kernel/prebuilts/boot-artifacts/ramdisks/${DEVICE}.img
+          ln -sf ../vendor_ramdisk-${DEVICE}.img android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk/${DEVICE}.img
+
+          # OPTIONAL: if you want to use your locally committed vendor_ramdisk00 instead:
+          # cp -f vendor_ramdisk00 android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-${DEVICE}.img
 
       - name: Sanity check vendor ramdisk exists
-        shell: bash
         run: |
           set -euo pipefail
-          ls -lah android-kernel/prebuilts/boot-artifacts/ramdisks || true
-          test -f android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
+          ls -al android-kernel/prebuilts/boot-artifacts/ramdisks
+          ls -al android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk || true
+          test -e "android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-${DEVICE}.img"
+          test -e "android-kernel/prebuilts/boot-artifacts/ramdisks/${DEVICE}.img"
+          test -e "android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk/${DEVICE}.img"
 
-      - name: Compile Kernel (build_slider.sh) + fix __isoc23_* host link errors
-        shell: bash
+      - name: Build (bazel fast config)
         run: |
           set -euo pipefail
-          set -x
           cd android-kernel
+          # Do NOT force HOSTLD=ld.bfd (that caused your ld.bfd: not found error)
+          tools/bazel run --config=fast --config=stamp //private/google-modules/soc/gs:slider_dist
 
-          # Force host tools (resolve_btfids) to build with GCC and avoid C23 __isoc23_* symbols
-          export HOSTCC=gcc
-          export HOSTCXX=g++
-          export HOSTCFLAGS="-std=gnu11"
-          export HOSTCXXFLAGS="-std=gnu++17"
-
-          BUILD_AOSP_KERNEL=1 ./build_slider.sh 2>&1 | tee /tmp/build.log
-
-      - name: Pack images to upload
-        shell: bash
+      - name: Pack images
         run: |
           set -euo pipefail
           mkdir -p images
-
-          cp -av android-kernel/out/slider/dist/boot.img images/
-          cp -av android-kernel/out/slider/dist/dtbo.img images/
-          cp -av android-kernel/out/slider/dist/vendor_boot.img images/
-          cp -av android-kernel/out/slider/dist/vendor_dlkm.img images/
-
-          cp -av flash-all.sh images/ || true
-          cp -av flash-all.bat images/ || true
-
+          cp android-kernel/out/slider/dist/boot.img images/
+          cp android-kernel/out/slider/dist/dtbo.img images/
+          cp android-kernel/out/slider/dist/vendor_boot.img images/
+          cp android-kernel/out/slider/dist/vendor_dlkm.img images/
+          cp -f flash-all.sh images/ || true
+          cp -f flash-all.bat images/ || true
           zip -r images.zip images
 
-      - name: Upload files
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: the-images
