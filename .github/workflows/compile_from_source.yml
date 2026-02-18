@@ -23,14 +23,20 @@ jobs:
 
       - name: Free up space
         uses: jlumbroso/free-disk-space@main
-
+        
       - name: Install packages
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get upgrade -y
-          sudo apt-get install -y repo git curl unzip zip python3
+          sudo apt-get install -y \
+            repo git curl unzip zip python3 python3-pip \
+            bc bison flex make rsync \
+            libssl-dev libelf-dev dwarves \
+            gcc clang lld \
+            build-essential \
+            ca-certificates
+
 
       - name: Sync kernel repo
         shell: bash
