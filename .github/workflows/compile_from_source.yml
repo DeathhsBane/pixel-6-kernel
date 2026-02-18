@@ -1,93 +1,129 @@
-# This is a basic workflow to help you get started with Actions
-
 name: Compile Kernel from Source
 
-# Controls when the workflow will run
 on:
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/compile_from_source.yml'
-      - 'vendor_ramdisk00'
-      - 'flash-all.bat'
-      - 'flash-all.sh'
+      - ".github/workflows/compile_from_source.yml"
+      - "vendor_ramdisk00"
+      - "flash-all.bat"
+      - "flash-all.sh"
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
     env:
-      FACTORY_IMAGE: raven-ap1a.240505.004
+      FACTORY_IMAGE: oriole-ap2a.240905.003.f1
+      FACTORY_ZIP_URL: https://dl.google.com/dl/android/aosp/oriole-ap2a.240905.003.f1-factory-655c44e7.zip
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       - name: Checkout Project
-        uses: actions/checkout@v4.1.7
-        
-      - name: Install packages
-        run: |
-          sudo apt-get update
-          sudo apt-get upgrade -y
-          sudo apt-get install repo
+        uses: actions/checkout@v4
 
       - name: Free up space
         uses: jlumbroso/free-disk-space@main
 
-      # Runs a set of commands using the runners shell
-      - name: Sync kernel repo
+      - name: Install packages
+        shell: bash
         run: |
-          mkdir android-kernel
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get upgrade -y
+          sudo apt-get install -y repo git curl unzip zip python3
+
+      - name: Sync kernel repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android-kernel
           cd android-kernel
           repo init -u https://android.googlesource.com/kernel/manifest -b android14-gs-pixel-6.1
-          repo sync -c --no-tags
+          repo sync -c --no-tags -j1 --fail-fast --force-sync --no-clone-bundle
+
+      - name: Force-enable BT USB (ASUS BT500) in defconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd android-kernel
+
+          DEF="$(find . -type f -name gki_defconfig | head -n 1)"
+          if [ -z "${DEF}" ]; then
+            echo "ERROR: gki_defconfig not found" >&2
+            exit 1
+          fi
+
+          echo "[+] Using defconfig: ${DEF}"
+          cp -av "${DEF}" "${DEF}.bak"
+
+          # Ensure Bluetooth core + USB HCI dongle support (btusb)
+          grep -q '^CONFIG_BT=' "${DEF}" || echo 'CONFIG_BT=y' >> "${DEF}"
+          grep -q '^CONFIG_BT_HCI=' "${DEF}" || echo 'CONFIG_BT_HCI=y' >> "${DEF}"
+          grep -q '^CONFIG_BT_RFCOMM=' "${DEF}" || echo 'CONFIG_BT_RFCOMM=y' >> "${DEF}"
+          grep -q '^CONFIG_BT_HCIBTUSB=' "${DEF}" || echo 'CONFIG_BT_HCIBTUSB=y' >> "${DEF}"
+
+          # Ensure USB stack basics are on (usually already)
+          grep -q '^CONFIG_USB=' "${DEF}" || echo 'CONFIG_USB=y' >> "${DEF}"
+          grep -q '^CONFIG_USB_SUPPORT=' "${DEF}" || echo 'CONFIG_USB_SUPPORT=y' >> "${DEF}"
+
+          echo "----- tail ${DEF} -----"
+          tail -n 60 "${DEF}"
 
       - name: Update vendor ramdisk (through curl)
-        if: true
+        shell: bash
         run: |
-          curl -O "https://dl.google.com/dl/android/aosp/raven-ap1a.240505.004-factory-9d783215.zip"
-          unzip raven-ap1a.240505.004-factory-9d783215.zip
-          cd ${FACTORY_IMAGE}
-          unzip image-${FACTORY_IMAGE}.zip vendor_boot.img
+          set -euo pipefail
+
+          curl -fL -o factory.zip "${FACTORY_ZIP_URL}"
+          unzip -q factory.zip
+
+          cd "${FACTORY_IMAGE}"
+          unzip -q "image-${FACTORY_IMAGE}.zip" vendor_boot.img
           mv vendor_boot.img ..
           cd ..
-          ls
-          pwd
-          android-kernel/tools/mkbootimg/unpack_bootimg.py --boot_img vendor_boot.img --out vendor_boot_out
-          cp vendor_boot_out/vendor-ramdisk-by-name/ramdisk_ android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
 
-      - name: Update vendor ramdisk (locally)
-        if: false
-        run: |
-          cp vendor_ramdisk00 android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
+          ls -lah
+          pwd
+
+          android-kernel/tools/mkbootimg/unpack_bootimg.py --boot_img vendor_boot.img --out vendor_boot_out
+
+          # Replace the vendor ramdisk artifact used by the build system
+          cp -av vendor_boot_out/vendor-ramdisk-by-name/ramdisk_ \
+            android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
 
       - name: Compile Kernel
+        shell: bash
         run: |
+          set -euo pipefail
           cd android-kernel
           tools/bazel run --config=fast --config=stamp //private/google-modules/soc/gs:slider_dist
 
       - name: Pack images to upload
+        shell: bash
         run: |
-          mkdir images
-          cp android-kernel/out/slider/dist/boot.img images
-          cp android-kernel/out/slider/dist/dtbo.img images
-          cp android-kernel/out/slider/dist/vendor_boot.img images
-          cp android-kernel/out/slider/dist/vendor_dlkm.img images
-          cp flash-all.sh images
-          cp flash-all.bat images
-          zip images.zip images -r
+          set -euo pipefail
+          mkdir -p images
+
+          cp -av android-kernel/out/slider/dist/boot.img images/
+          cp -av android-kernel/out/slider/dist/dtbo.img images/
+          cp -av android-kernel/out/slider/dist/vendor_boot.img images/
+          cp -av android-kernel/out/slider/dist/vendor_dlkm.img images/
+
+          cp -av flash-all.sh images/
+          cp -av flash-all.bat images/
+
+          zip -r images.zip images
 
       - name: Storage Check
+        shell: bash
         run: |
+          set -euo pipefail
           df -h
           cd android-kernel
-          du -s -h
+          du -sh . || true
 
       - name: Upload files
-        uses: actions/upload-artifact@v4.3.3
+        uses: actions/upload-artifact@v4
         with:
           name: the-images
           path: images.zip
