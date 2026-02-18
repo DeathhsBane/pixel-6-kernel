@@ -38,9 +38,10 @@ jobs:
           echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
           /usr/bin/ls -al "${GITHUB_WORKSPACE}"
 
-          if [ ! -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
-            echo "ERROR: Missing file: ${GITHUB_WORKSPACE}/vendor_ramdisk00" >&2
-            echo "Commit your extracted vendor ramdisk blob at repo root as: vendor_ramdisk00" >&2
+          test -f "${GITHUB_WORKSPACE}/vendor_ramdisk00"
+
+          if [ ! -f "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" ]; then
+            echo "ERROR: Missing build_kali_nethunter.sh at repo root." >&2
             exit 1
           fi
 
@@ -66,7 +67,7 @@ jobs:
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo + out + ccache (best-effort speedup)
+      - name: Cache repo + out + ccache (best-effort)
         continue-on-error: true
         uses: actions/cache@v4
         with:
@@ -102,16 +103,16 @@ jobs:
             --optimized-fetch \
             --prune
 
-      - name: Find + patch gki_defconfig
+      - name: Find + patch gki_defconfig (no ./aosp assumption)
         shell: bash
         run: |
           set -euo pipefail
           cd "${KERNEL_TOP}"
 
-          DEFCONFIG_PATH="$(find ./aosp ./common -type f -path "*/arch/arm64/configs/gki_defconfig" -print -quit || true)"
+          DEFCONFIG_PATH="$(find ./common ./aosp -type f -path "*/arch/arm64/configs/gki_defconfig" -print -quit 2>/dev/null || true)"
           if [ -z "${DEFCONFIG_PATH}" ]; then
-            echo "ERROR: gki_defconfig not found under ./aosp or ./common" >&2
-            find . -maxdepth 8 -type f -name "gki_defconfig" -print || true
+            echo "ERROR: gki_defconfig not found under ./common or ./aosp" >&2
+            find . -maxdepth 10 -type f -name "gki_defconfig" -print 2>/dev/null || true
             exit 1
           fi
           echo "Using defconfig: ${DEFCONFIG_PATH}"
@@ -144,11 +145,23 @@ jobs:
           test -e "${RAMDISK_DIR}/oriole.img"
           test -e "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
 
-      - name: Build
+      - name: Discover possible build entrypoints (debug helper)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${KERNEL_TOP}"
+          echo "Repo-root scripts:"
+          /usr/bin/ls -al "${GITHUB_WORKSPACE}" | sed -n '1,200p'
+          echo ""
+          echo "Kernel-top scripts:"
+          /usr/bin/find "${KERNEL_TOP}" -maxdepth 3 -type f -name "*.sh" -print 2>/dev/null | sed -n '1,200p' || true
+          echo ""
+          echo "Kernel-top build configs:"
+          /usr/bin/find "${KERNEL_TOP}" -maxdepth 4 -type f -name "build.config*" -print 2>/dev/null | sed -n '1,200p' || true
+
+      - name: Build (always use your repo-root script)
+        shell: bash
+        run: |
+          set -euo pipefail
 
           export HOSTCC=/usr/bin/gcc
           export HOSTCXX=/usr/bin/g++
@@ -161,26 +174,22 @@ jobs:
           ccache -M 5G || true
           ccache -z || true
 
-          if [ -x "${KERNEL_TOP}/build_slider.sh" ]; then
-            ./build_slider.sh | tee "${GITHUB_WORKSPACE}/build.log"
-          elif [ -x "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" ]; then
-            /usr/bin/bash "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" | tee "${GITHUB_WORKSPACE}/build.log"
-          else
-            echo "ERROR: No build entrypoint found (build_slider.sh or build_kali_nethunter.sh)." >&2
-            exit 1
-          fi
+          chmod +x "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" || true
+          /usr/bin/bash -x "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" | tee "${GITHUB_WORKSPACE}/build.log"
 
           ccache -s || true
 
-      - name: Collect dist output (never fails)
+      - name: Collect outputs (never fails)
         if: always()
         shell: bash
         run: |
           set -u
           echo "dist candidates:"
+          /usr/bin/find "${KERNEL_TOP}/out" -maxdepth 8 -type d -name dist -print 2>/dev/null || true
+          echo ""
+          echo "out tree (top):"
           /usr/bin/ls -al "${KERNEL_TOP}/out" 2>/dev/null || true
-          /usr/bin/find "${KERNEL_TOP}/out" -maxdepth 6 -type d -name dist -print 2>/dev/null || true
-
+          echo ""
           echo "last 200 lines build.log:"
           /usr/bin/tail -n 200 "${GITHUB_WORKSPACE}/build.log" 2>/dev/null || true
 
@@ -191,5 +200,6 @@ jobs:
           name: oriole-build
           path: |
             android-kernel/out/**/dist/**
+            android-kernel/out/**
             build.log
           if-no-files-found: warn
