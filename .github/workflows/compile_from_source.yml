@@ -62,16 +62,30 @@ jobs:
           repo init -u https://android.googlesource.com/kernel/manifest -b "${KERNEL_BRANCH}"
           repo sync -c --no-tags --no-clone-bundle --optimized-fetch --prune -j"$(nproc)"
 
-      - name: Patch config (BTUSB + USB)
+      - name: Locate and patch GKI defconfig (auto-detect)
         run: |
           set -euo pipefail
           cd android-kernel
-          CFG="aosp/arch/arm64/configs/gki_defconfig"
-          grep -q '^CONFIG_BT_HCI=y' "$CFG" || echo 'CONFIG_BT_HCI=y' >> "$CFG"
-          grep -q '^CONFIG_BT_HCIBTUSB=y' "$CFG" || echo 'CONFIG_BT_HCIBTUSB=y' >> "$CFG"
-          grep -q '^CONFIG_USB=y' "$CFG" || echo 'CONFIG_USB=y' >> "$CFG"
-          grep -q '^CONFIG_USB_SUPPORT=y' "$CFG" || echo 'CONFIG_USB_SUPPORT=y' >> "$CFG"
-          tail -n 20 "$CFG"
+
+          echo "Searching for gki_defconfig..."
+          DEFCONFIG="$(find . -type f -path "*/arch/arm64/configs/gki_defconfig" -o -path "*/common/arch/arm64/configs/gki_defconfig" 2>/dev/null | head -n 1 || true)"
+
+          if [ -z "${DEFCONFIG}" ]; then
+            echo "ERROR: Could not find gki_defconfig in tree."
+            echo "Here are likely config directories:"
+            find . -maxdepth 4 -type d -name configs -print || true
+            exit 1
+          fi
+
+          echo "Using defconfig: ${DEFCONFIG}"
+
+          grep -q '^CONFIG_BT_HCI=y' "${DEFCONFIG}" || echo 'CONFIG_BT_HCI=y' >> "${DEFCONFIG}"
+          grep -q '^CONFIG_BT_HCIBTUSB=y' "${DEFCONFIG}" || echo 'CONFIG_BT_HCIBTUSB=y' >> "${DEFCONFIG}"
+          grep -q '^CONFIG_USB=y' "${DEFCONFIG}" || echo 'CONFIG_USB=y' >> "${DEFCONFIG}"
+          grep -q '^CONFIG_USB_SUPPORT=y' "${DEFCONFIG}" || echo 'CONFIG_USB_SUPPORT=y' >> "${DEFCONFIG}"
+
+          echo "Patched tail of defconfig:"
+          tail -n 25 "${DEFCONFIG}"
 
       - name: Download factory image and extract vendor_boot
         run: |
@@ -92,22 +106,15 @@ jobs:
             --boot_img vendor_boot.img \
             --out vendor_boot_out
 
-          # This is the actual vendor ramdisk blob produced by Google's vendor_boot
           VENDOR_RAMDISK_SRC="vendor_boot_out/vendor-ramdisk-by-name/ramdisk_"
 
-          # Create all paths some scripts look for
           mkdir -p android-kernel/prebuilts/boot-artifacts/ramdisks
           mkdir -p android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk
 
-          # Canonical filename (the one your previous log complained about)
-          cp -f "${VENDOR_RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-${DEVICE}.img
+          cp -f "${VENDOR_RAMDISK_SRC}" "android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-${DEVICE}.img"
 
-          # Also provide alternate names/paths (some build scripts look for these)
-          ln -sf ../vendor_ramdisk-${DEVICE}.img android-kernel/prebuilts/boot-artifacts/ramdisks/${DEVICE}.img
-          ln -sf ../vendor_ramdisk-${DEVICE}.img android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk/${DEVICE}.img
-
-          # OPTIONAL: if you want to use your locally committed vendor_ramdisk00 instead:
-          # cp -f vendor_ramdisk00 android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-${DEVICE}.img
+          ln -sf "../vendor_ramdisk-${DEVICE}.img" "android-kernel/prebuilts/boot-artifacts/ramdisks/${DEVICE}.img"
+          ln -sf "../vendor_ramdisk-${DEVICE}.img" "android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk/${DEVICE}.img"
 
       - name: Sanity check vendor ramdisk exists
         run: |
@@ -122,7 +129,6 @@ jobs:
         run: |
           set -euo pipefail
           cd android-kernel
-          # Do NOT force HOSTLD=ld.bfd (that caused your ld.bfd: not found error)
           tools/bazel run --config=fast --config=stamp //private/google-modules/soc/gs:slider_dist
 
       - name: Pack images
