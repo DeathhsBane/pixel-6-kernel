@@ -12,7 +12,7 @@ on:
 
 concurrency:
   group: compile-from-source-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -44,7 +44,7 @@ jobs:
             exit 1
           fi
 
-      - name: Install build deps (binutils/ld.bfd + toolchain)
+      - name: Install build deps
         shell: bash
         run: |
           set -euo pipefail
@@ -57,7 +57,7 @@ jobs:
 
           command -v /usr/bin/ld.bfd >/dev/null 2>&1 || (echo "ERROR: /usr/bin/ld.bfd missing" >&2; exit 1)
 
-      - name: Install repo tool (writable launcher)
+      - name: Install repo tool
         shell: bash
         run: |
           set -euo pipefail
@@ -74,8 +74,9 @@ jobs:
             android-kernel/.repo
             android-kernel/out
             .ccache
-          key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
+          key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ github.ref_name }}-${{ github.sha }}
           restore-keys: |
+            pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ github.ref_name }}-
             pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
 
       - name: repo init + sync (creates android-kernel/)
@@ -85,10 +86,12 @@ jobs:
           mkdir -p "${KERNEL_TOP}"
           cd "${KERNEL_TOP}"
 
-          /usr/local/bin/repo init \
-            -u https://android.googlesource.com/kernel/manifest \
-            -b "${KERNEL_BRANCH}" \
-            --depth=1
+          if [ ! -d ".repo" ]; then
+            /usr/local/bin/repo init \
+              -u https://android.googlesource.com/kernel/manifest \
+              -b "${KERNEL_BRANCH}" \
+              --depth=1
+          fi
 
           /usr/local/bin/repo sync \
             -c \
@@ -99,16 +102,12 @@ jobs:
             --optimized-fetch \
             --prune
 
-          echo "Kernel tree top-level:"
-          /usr/bin/ls -al "${KERNEL_TOP}"
-
-      - name: Find + patch gki_defconfig (robust)
+      - name: Find + patch gki_defconfig
         shell: bash
         run: |
           set -euo pipefail
           cd "${KERNEL_TOP}"
 
-          echo "Searching for gki_defconfig..."
           DEFCONFIG_PATH="$(find ./aosp ./common -type f -path "*/arch/arm64/configs/gki_defconfig" -print -quit || true)"
           if [ -z "${DEFCONFIG_PATH}" ]; then
             echo "ERROR: gki_defconfig not found under ./aosp or ./common" >&2
@@ -126,7 +125,6 @@ jobs:
             grep -qxF "${line}" "${DEFCONFIG_PATH}" || echo "${line}" >> "${DEFCONFIG_PATH}"
           done
 
-          echo "Patched tail of defconfig:"
           tail -n 40 "${DEFCONFIG_PATH}"
 
       - name: Provide vendor ramdisk (from repo root vendor_ramdisk00)
@@ -136,13 +134,10 @@ jobs:
           mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
 
           cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-
           ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
           ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
 
-          echo "ramdisks:"
           /usr/bin/ls -al "${RAMDISK_DIR}"
-          echo "ramdisks/vendor_ramdisk:"
           /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
 
           test -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
@@ -163,21 +158,38 @@ jobs:
 
           export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
           mkdir -p "${CCACHE_DIR}"
+          ccache -M 5G || true
+          ccache -z || true
 
           if [ -x "${KERNEL_TOP}/build_slider.sh" ]; then
             ./build_slider.sh | tee "${GITHUB_WORKSPACE}/build.log"
           elif [ -x "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" ]; then
             /usr/bin/bash "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" | tee "${GITHUB_WORKSPACE}/build.log"
           else
-            echo "ERROR: No build entrypoint found (expected build_slider.sh in kernel tree or build_kali_nethunter.sh in repo root)." >&2
+            echo "ERROR: No build entrypoint found (build_slider.sh or build_kali_nethunter.sh)." >&2
             exit 1
           fi
 
-      - name: Collect dist output
+          ccache -s || true
+
+      - name: Collect dist output (never fails)
         if: always()
         shell: bash
         run: |
-          set -euo pipefail
-          echo "dist (if present):"
-          /usr/bin/ls -al "${KERNEL_TOP}/out" || true
-          find "${KERNEL_TOP}/out" -_
+          set -u
+          echo "dist candidates:"
+          /usr/bin/ls -al "${KERNEL_TOP}/out" 2>/dev/null || true
+          /usr/bin/find "${KERNEL_TOP}/out" -maxdepth 6 -type d -name dist -print 2>/dev/null || true
+
+          echo "last 200 lines build.log:"
+          /usr/bin/tail -n 200 "${GITHUB_WORKSPACE}/build.log" 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oriole-build
+          path: |
+            android-kernel/out/**/dist/**
+            build.log
+          if-no-files-found: warn
