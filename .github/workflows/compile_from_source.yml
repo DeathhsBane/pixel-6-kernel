@@ -2,6 +2,11 @@ name: Pixel 6 Kernel (oriole) — fast, repeatable CI
 
 on:
   workflow_dispatch:
+    inputs:
+      factory_zip:
+        description: "Pixel 6 (oriole) factory zip filename (from Google factory images)"
+        required: true
+        default: "oriole-ap2a.240905.003.f1-factory-655c44e7.zip"
   push:
     branches:
       - main
@@ -22,7 +27,7 @@ jobs:
       DEVICE: oriole
       KERNEL_TOP: /home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel
       RAMDISK_DIR: /home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks
-      VENDOR_BOOT_IMG: /home/runner/work/pixel-6-kernel/pixel-6-kernel/prebuilts/vendor_boot-oriole.img
+      FACTORY_BASE_URL: https://dl.google.com/dl/android/aosp
 
     steps:
       - name: Checkout
@@ -30,44 +35,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install build deps (fix ld.bfd + host toolchain)
+      - name: Install build deps (binutils/ld.bfd + host toolchain)
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bash \
-            bc \
-            bison \
-            build-essential \
-            ca-certificates \
-            clang \
-            cpio \
-            curl \
-            flex \
-            gcc \
-            git \
-            g++ \
-            lld \
-            llvm \
-            make \
-            ninja-build \
-            openssl \
-            pahole \
-            pkg-config \
-            python3 \
-            python3-pip \
-            rsync \
-            unzip \
-            xz-utils \
-            zstd \
-            binutils \
-            binutils-dev \
-            file
+            bash bc bison build-essential ca-certificates clang cpio curl flex \
+            gcc g++ git lld llvm make ninja-build openssl pahole pkg-config \
+            python3 python3-pip rsync unzip xz-utils zstd \
+            binutils binutils-dev file
 
-          command -v ld.bfd >/dev/null 2>&1 || true
-          command -v ld >/dev/null 2>&1
-          command -v gcc >/dev/null 2>&1
+          command -v /usr/bin/ld.bfd >/dev/null 2>&1
+          /usr/bin/ld.bfd --version | head -n 1 || true
 
       - name: Install repo (writable launcher)
         shell: bash
@@ -92,10 +72,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd /home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel
+          cd "${KERNEL_TOP}"
 
-          if [ ! -d "/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/.repo" ]; then
-            echo "ERROR: android-kernel/.repo missing. Commit your repo init state, or add an init step here." >&2
+          if [ ! -d "${KERNEL_TOP}/.repo" ]; then
+            echo "ERROR: android-kernel/.repo missing. Commit your repo init state, or add an init step." >&2
             exit 1
           fi
 
@@ -112,114 +92,148 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cd /home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel
+          cd "${KERNEL_TOP}"
 
           echo "Searching for gki_defconfig..."
           DEFCONFIG_PATH="$(find ./aosp ./common -type f -path "*/arch/arm64/configs/gki_defconfig" -print -quit || true)"
           if [ -z "${DEFCONFIG_PATH}" ]; then
             echo "ERROR: gki_defconfig not found under ./aosp or ./common" >&2
-            find . -maxdepth 4 -type f -name "gki_defconfig" -print || true
+            find . -maxdepth 6 -type f -name "gki_defconfig" -print || true
             exit 1
           fi
           echo "Using defconfig: ${DEFCONFIG_PATH}"
 
-          echo "" >> "${DEFCONFIG_PATH}"
-          echo "CONFIG_BT_HCI=y" >> "${DEFCONFIG_PATH}"
-          echo "CONFIG_BT_HCIBTUSB=y" >> "${DEFCONFIG_PATH}"
-          echo "CONFIG_USB=y" >> "${DEFCONFIG_PATH}"
-          echo "CONFIG_USB_SUPPORT=y" >> "${DEFCONFIG_PATH}"
+          {
+            echo ""
+            echo "CONFIG_BT_HCI=y"
+            echo "CONFIG_BT_HCIBTUSB=y"
+            echo "CONFIG_USB=y"
+            echo "CONFIG_USB_SUPPORT=y"
+          } >> "${DEFCONFIG_PATH}"
 
           echo "Patched tail of defconfig:"
           tail -n 40 "${DEFCONFIG_PATH}"
 
-      - name: Prepare vendor ramdisk (no more missing file failures)
+      - name: Download factory zip + extract vendor_boot.img
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -f "/home/runner/work/pixel-6-kernel/pixel-6-kernel/prebuilts/vendor_boot-oriole.img" ]; then
-            echo "ERROR: Missing vendor boot image at:" >&2
-            echo "  /home/runner/work/pixel-6-kernel/pixel-6-kernel/prebuilts/vendor_boot-oriole.img" >&2
-            echo "" >&2
-            echo "Put your Pixel 6 vendor_boot.img there (commit it or download it in a prior step)." >&2
-            exit 1
+          FACTORY_ZIP="${{ github.event.inputs.factory_zip || 'oriole-ap2a.240905.003.f1-factory-655c44e7.zip' }}"
+          echo "Factory zip: ${FACTORY_ZIP}"
+
+          mkdir -p /home/runner/work/pixel-6-kernel/pixel-6-kernel/prebuilts
+          cd /home/runner/work/pixel-6-kernel/pixel-6-kernel/prebuilts
+
+          if [ ! -f "${FACTORY_ZIP}" ]; then
+            curl -fL --retry 5 --retry-delay 2 -o "${FACTORY_ZIP}" "${FACTORY_BASE_URL}/${FACTORY_ZIP}"
           fi
 
-          rm -rf /home/runner/work/pixel-6-kernel/pixel-6-kernel/vendor_boot_out
-          mkdir -p /home/runner/work/pixel-6-kernel/pixel-6-kernel/vendor_boot_out
+          rm -f vendor_boot-oriole.img
+          unzip -p "${FACTORY_ZIP}" "vendor_boot.img" > vendor_boot-oriole.img
+
+          test -s vendor_boot-oriole.img
+          ls -al vendor_boot-oriole.img
+
+      - name: Prepare vendor ramdisk (create vendor_ramdisk-oriole.img)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TOP="/home/runner/work/pixel-6-kernel/pixel-6-kernel"
+          VENDOR_BOOT="${TOP}/prebuilts/vendor_boot-oriole.img"
+          OUTDIR="${TOP}/vendor_boot_out"
+          RAMDISKS="${RAMDISK_DIR}"
+          DEVICE="${DEVICE}"
+
+          rm -rf "${OUTDIR}"
+          mkdir -p "${OUTDIR}"
+          mkdir -p "${RAMDISKS}"
 
           python3 - <<'PY'
 import os, sys, subprocess, shutil, pathlib
 
-top = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel")
-vendor_boot = top / "prebuilts" / "vendor_boot-oriole.img"
-outdir = top / "vendor_boot_out"
-ramdisks = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks")
+TOP = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel")
+VENDOR_BOOT = TOP / "prebuilts" / "vendor_boot-oriole.img"
+OUTDIR = TOP / "vendor_boot_out"
+RAMDISKS = pathlib.Path("/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks")
+DEVICE = os.environ.get("DEVICE", "oriole")
 
-ramdisks.mkdir(parents=True, exist_ok=True)
-(outdir).mkdir(parents=True, exist_ok=True)
+RAMDISKS.mkdir(parents=True, exist_ok=True)
+OUTDIR.mkdir(parents=True, exist_ok=True)
 
-unpack = top / "android-kernel" / "build" / "kernel" / "build-tools" / "path" / "linux-x86" / "unpack_bootimg"
+unpack = TOP / "android-kernel" / "build" / "kernel" / "build-tools" / "path" / "linux-x86" / "unpack_bootimg"
 if not unpack.exists():
-    # fallback: try to use any unpack_bootimg in PATH
-    unpack = shutil.which("unpack_bootimg")
-    if not unpack:
+    alt = shutil.which("unpack_bootimg")
+    if not alt:
         print("ERROR: unpack_bootimg not found (build-tools/path or PATH).", file=sys.stderr)
         sys.exit(1)
+    unpack = pathlib.Path(alt)
 
-cmd = [str(unpack), "--boot_img", str(vendor_boot), "--out", str(outdir)]
-subprocess.check_call(cmd)
+subprocess.check_call([str(unpack), "--boot_img", str(VENDOR_BOOT), "--out", str(OUTDIR)])
 
-# AOSP unpack_bootimg for vendor_boot v4 writes vendor ramdisks into vendor-ramdisk-by-name/
-byname = outdir / "vendor-ramdisk-by-name"
+byname = OUTDIR / "vendor-ramdisk-by-name"
 if not byname.exists():
     print(f"ERROR: expected {byname} not found after unpack.", file=sys.stderr)
     sys.exit(1)
 
-# Find the first vendor ramdisk file (ramdisk_*). Keep behavior aligned with your logs.
 cands = sorted([p for p in byname.iterdir() if p.is_file() and p.name.startswith("ramdisk")])
 if not cands:
     print(f"ERROR: no vendor ramdisk blobs found in {byname}", file=sys.stderr)
     sys.exit(1)
 
 src = cands[0]
-dst = ramdisks / "vendor_ramdisk-oriole.img"
+dst = RAMDISKS / f"vendor_ramdisk-{DEVICE}.img"
 
-# Replace with a real file (not symlink) to keep kernel scripts happy
+# Ensure dst is a REAL FILE (not symlink), so downstream scripts won't choke
 if dst.exists() or dst.is_symlink():
     dst.unlink()
 shutil.copy2(src, dst)
 
-# Create the exact symlinks your tree expects (matches your logs)
-for link in [
-    ramdisks / "oriole.img",
-]:
-    if link.exists() or link.is_symlink():
-        link.unlink()
-    link.symlink_to(dst.name)
+# Symlink expected convenience names
+top_link = RAMDISKS / f"{DEVICE}.img"
+if top_link.exists() or top_link.is_symlink():
+    top_link.unlink()
+top_link.symlink_to(dst.name)  # link within same dir
 
-nested = ramdisks / "vendor_ramdisk"
+nested = RAMDISKS / "vendor_ramdisk"
 nested.mkdir(parents=True, exist_ok=True)
-nested_link = nested / "oriole.img"
+nested_link = nested / f"{DEVICE}.img"
 if nested_link.exists() or nested_link.is_symlink():
     nested_link.unlink()
 nested_link.symlink_to(pathlib.Path("..") / dst.name)
 
 print("ramdisks dir:")
-subprocess.check_call(["/usr/bin/ls", "-al", str(ramdisks)])
+subprocess.check_call(["/usr/bin/ls", "-al", str(RAMDISKS)])
 print("vendor_ramdisk dir:")
 subprocess.check_call(["/usr/bin/ls", "-al", str(nested)])
 PY
 
-          test -f "/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img"
-          test -e "/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks/oriole.img"
-          test -e "/home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk/oriole.img"
+          # Fail only if NONE of the expected locations exist (robust)
+          FOUND=0
+          for p in \
+            "${RAMDISK_DIR}/vendor_ramdisk-${DEVICE}.img" \
+            "${RAMDISK_DIR}/${DEVICE}.img" \
+            "${RAMDISK_DIR}/vendor_ramdisk/${DEVICE}.img"
+          do
+            if [ -e "${p}" ]; then
+              echo "OK: found ${p}"
+              FOUND=1
+            else
+              echo "MISS: ${p}"
+            fi
+          done
+
+          if [ "${FOUND}" -ne 1 ]; then
+            echo "ERROR: vendor ramdisk not found in any expected location." >&2
+            exit 1
+          fi
 
       - name: Build (force host tools to use system gcc/binutils)
         shell: bash
         run: |
           set -euo pipefail
-          cd /home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel
+          cd "${KERNEL_TOP}"
 
           export HOSTCC=/usr/bin/gcc
           export HOSTCXX=/usr/bin/g++
@@ -234,9 +248,9 @@ PY
         shell: bash
         run: |
           set -euo pipefail
-          cd /home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel
+          cd "${KERNEL_TOP}"
           echo "dist:"
-          ls -al /home/runner/work/pixel-6-kernel/pixel-6-kernel/android-kernel/out/mixed/dist || true
+          ls -al "${KERNEL_TOP}/out/mixed/dist" || true
           echo "last 200 lines build.log:"
           tail -n 200 /tmp/build.log || true
 
