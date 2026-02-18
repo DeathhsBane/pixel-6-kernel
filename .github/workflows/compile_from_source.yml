@@ -38,7 +38,7 @@ jobs:
           set -euo pipefail
           mkdir -p android-kernel
           cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest -b android14-gs-pixel-6.1
+          repo init -u https://android.googlesource.com/kernel/manifest -b android-gs-raviole-5.10-android14
           repo sync -c --no-tags -j1 --fail-fast --force-sync --no-clone-bundle
 
       - name: Force-enable BT USB (ASUS BT500) in defconfig
