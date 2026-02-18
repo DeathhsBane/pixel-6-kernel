@@ -3,16 +3,13 @@ name: compile_from_source
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches: [ "main" ]
     paths:
       - ".github/workflows/compile_from_source.yml"
-      - "vendor_ramdisk00"
-      - "build_kali_nethunter.sh"
-      - "util_functions.sh"
 
 concurrency:
-  group: compile-from-source-${{ github.ref }}
-  cancel-in-progress: false
+  group: compile_from_source-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -20,10 +17,10 @@ jobs:
     timeout-minutes: 360
 
     env:
-      DEVICE: oriole
       KERNEL_BRANCH: android14-gs-pixel-6.1
-      KERNEL_TOP: ${{ github.workspace }}/android-kernel
-      RAMDISK_DIR: ${{ github.workspace }}/android-kernel/prebuilts/boot-artifacts/ramdisks
+      DEVICE: oriole
+      KERNEL_DIR: android-kernel
+      MANIFEST_URL: https://android.googlesource.com/kernel/manifest
 
     steps:
       - name: Checkout
@@ -31,32 +28,43 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sanity check repo contents
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
-          /usr/bin/ls -al "${GITHUB_WORKSPACE}"
-
-          test -f "${GITHUB_WORKSPACE}/vendor_ramdisk00"
-
-          if [ ! -f "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" ]; then
-            echo "ERROR: Missing build_kali_nethunter.sh at repo root." >&2
-            exit 1
-          fi
-
       - name: Install build deps
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ca-certificates clang cpio curl flex file git \
-            lld llvm lz4 make ninja-build openssl pahole pkg-config python3 python3-pip \
-            rsync unzip xz-utils zstd \
-            binutils binutils-dev libelf-dev libncurses-dev libssl-dev ccache
-
-          command -v /usr/bin/ld.bfd >/dev/null 2>&1 || (echo "ERROR: /usr/bin/ld.bfd missing" >&2; exit 1)
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            ccache \
+            clang \
+            cpio \
+            curl \
+            flex \
+            file \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            lz4 \
+            make \
+            ninja-build \
+            openssl \
+            pahole \
+            pkg-config \
+            python3 \
+            python3-pip \
+            rsync \
+            unzip \
+            xz-utils \
+            zstd
+          clang --version
+          ld.lld --version || true
+          /usr/bin/ccache -V || true
 
       - name: Install repo tool
         shell: bash
@@ -67,31 +75,25 @@ jobs:
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo + out + ccache (best-effort)
-        continue-on-error: true
+      - name: Cache repo checkout
         uses: actions/cache@v4
         with:
           path: |
             android-kernel/.repo
-            android-kernel/out
-            .ccache
-          key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ github.ref_name }}-${{ github.sha }}
+          key: repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
           restore-keys: |
-            pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ github.ref_name }}-
-            pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
+            repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
 
-      - name: repo init + sync (creates android-kernel/)
+      - name: repo init + sync
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${KERNEL_TOP}"
-          cd "${KERNEL_TOP}"
+
+          mkdir -p "${KERNEL_DIR}"
+          cd "${KERNEL_DIR}"
 
           if [ ! -d ".repo" ]; then
-            /usr/local/bin/repo init \
-              -u https://android.googlesource.com/kernel/manifest \
-              -b "${KERNEL_BRANCH}" \
-              --depth=1
+            /usr/local/bin/repo init -u "${MANIFEST_URL}" -b "${KERNEL_BRANCH}"
           fi
 
           /usr/local/bin/repo sync \
@@ -103,103 +105,76 @@ jobs:
             --optimized-fetch \
             --prune
 
-      - name: Find + patch gki_defconfig (no ./aosp assumption)
+      - name: Patch gki_defconfig (BT USB)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${KERNEL_TOP}"
+          cd "${KERNEL_DIR}"
 
-          DEFCONFIG_PATH="$(find ./common ./aosp -type f -path "*/arch/arm64/configs/gki_defconfig" -print -quit 2>/dev/null || true)"
-          if [ -z "${DEFCONFIG_PATH}" ]; then
-            echo "ERROR: gki_defconfig not found under ./common or ./aosp" >&2
-            find . -maxdepth 10 -type f -name "gki_defconfig" -print 2>/dev/null || true
+          DEFCONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
+          if [ ! -f "${DEFCONFIG_PATH}" ]; then
+            echo "ERROR: expected defconfig not found: ${DEFCONFIG_PATH}" >&2
+            /usr/bin/find . -maxdepth 5 -name "gki_defconfig" -print || true
             exit 1
           fi
-          echo "Using defconfig: ${DEFCONFIG_PATH}"
 
-          for line in \
-            "CONFIG_BT_HCI=y" \
-            "CONFIG_BT_HCIBTUSB=y" \
-            "CONFIG_USB=y" \
-            "CONFIG_USB_SUPPORT=y"
-          do
-            grep -qxF "${line}" "${DEFCONFIG_PATH}" || echo "${line}" >> "${DEFCONFIG_PATH}"
-          done
+          append_once () {
+            local line="$1"
+            local file="$2"
+            if ! /usr/bin/grep -qxF "${line}" "${file}"; then
+              echo "${line}" >> "${file}"
+            fi
+          }
 
-          tail -n 40 "${DEFCONFIG_PATH}"
+          echo "" >> "${DEFCONFIG_PATH}"
+          append_once "CONFIG_BT=y" "${DEFCONFIG_PATH}"
+          append_once "CONFIG_BT_HCI=y" "${DEFCONFIG_PATH}"
+          append_once "CONFIG_BT_HCIBTUSB=y" "${DEFCONFIG_PATH}"
+          append_once "CONFIG_USB=y" "${DEFCONFIG_PATH}"
+          append_once "CONFIG_USB_SUPPORT=y" "${DEFCONFIG_PATH}"
 
-      - name: Provide vendor ramdisk (from repo root vendor_ramdisk00)
+          echo "Patched tail:"
+          /usr/bin/tail -n 40 "${DEFCONFIG_PATH}"
+
+      - name: Build (Bazel/Kleaf)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
+          cd "${KERNEL_DIR}"
 
-          cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-          ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
-          ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+          if [ ! -x "./tools/bazel" ]; then
+            echo "ERROR: ./tools/bazel not found or not executable." >&2
+            echo "This tree should support Bazel/Kleaf for Android 14+." >&2
+            exit 1
+          fi
 
-          /usr/bin/ls -al "${RAMDISK_DIR}"
-          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
+          TARGET="//gs/google-modules/soc-modules:slider_dist"
+          if ! ./tools/bazel query "${TARGET}" >/dev/null 2>&1; then
+            echo "WARN: ${TARGET} not found; falling back to //common:kernel_aarch64_dist" >&2
+            TARGET="//common:kernel_aarch64_dist"
+          fi
 
-          test -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-          test -e "${RAMDISK_DIR}/oriole.img"
-          test -e "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+          echo "Using Bazel target: ${TARGET}"
+          ./tools/bazel run "${TARGET}" 2>&1 | /usr/bin/tee /tmp/kernel-build.log
 
-      - name: Discover possible build entrypoints (debug helper)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Repo-root scripts:"
-          /usr/bin/ls -al "${GITHUB_WORKSPACE}" | sed -n '1,200p'
-          echo ""
-          echo "Kernel-top scripts:"
-          /usr/bin/find "${KERNEL_TOP}" -maxdepth 3 -type f -name "*.sh" -print 2>/dev/null | sed -n '1,200p' || true
-          echo ""
-          echo "Kernel-top build configs:"
-          /usr/bin/find "${KERNEL_TOP}" -maxdepth 4 -type f -name "build.config*" -print 2>/dev/null | sed -n '1,200p' || true
+          echo "Searching for dist dir..."
+          DIST_DIR="$(/usr/bin/find out -maxdepth 4 -type d -name dist -print -quit || true)"
+          if [ -z "${DIST_DIR}" ]; then
+            echo "ERROR: dist dir not found under ${KERNEL_DIR}/out" >&2
+            /usr/bin/find out -maxdepth 6 -type d -print | /usr/bin/head -n 200 || true
+            exit 1
+          fi
 
-      - name: Build (always use your repo-root script)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          export HOSTCC=/usr/bin/gcc
-          export HOSTCXX=/usr/bin/g++
-          export HOSTLD=/usr/bin/ld.bfd
-          export HOSTCFLAGS="-std=gnu11"
-          export HOSTCXXFLAGS="-std=gnu++17"
-
-          export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
-          mkdir -p "${CCACHE_DIR}"
-          ccache -M 5G || true
-          ccache -z || true
-
-          chmod +x "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" || true
-          /usr/bin/bash -x "${GITHUB_WORKSPACE}/build_kali_nethunter.sh" | tee "${GITHUB_WORKSPACE}/build.log"
-
-          ccache -s || true
-
-      - name: Collect outputs (never fails)
-        if: always()
-        shell: bash
-        run: |
-          set -u
-          echo "dist candidates:"
-          /usr/bin/find "${KERNEL_TOP}/out" -maxdepth 8 -type d -name dist -print 2>/dev/null || true
-          echo ""
-          echo "out tree (top):"
-          /usr/bin/ls -al "${KERNEL_TOP}/out" 2>/dev/null || true
-          echo ""
-          echo "last 200 lines build.log:"
-          /usr/bin/tail -n 200 "${GITHUB_WORKSPACE}/build.log" 2>/dev/null || true
+          echo "DIST_DIR=${DIST_DIR}" >> "${GITHUB_ENV}"
+          echo "Dist dir: ${DIST_DIR}"
+          /usr/bin/ls -al "${DIST_DIR}" || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: oriole-build
+          name: kernel-dist-${{ env.DEVICE }}
           path: |
-            android-kernel/out/**/dist/**
-            android-kernel/out/**
-            build.log
+            android-kernel/${{ env.DIST_DIR }}/**
+            /tmp/kernel-build.log
           if-no-files-found: warn
