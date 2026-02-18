@@ -11,7 +11,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     env:
       FACTORY_IMAGE: oriole-ap2a.240905.003.f1
@@ -23,29 +23,27 @@ jobs:
 
       - name: Free up space
         uses: jlumbroso/free-disk-space@main
-        
+
       - name: Install packages
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            repo git curl unzip zip python3 python3-pip \
-            bc bison flex make rsync \
+            repo git curl unzip zip python3 \
+            build-essential gcc g++ binutils \
+            bc bison flex rsync \
             libssl-dev libelf-dev dwarves \
-            gcc clang lld \
-            build-essential \
             ca-certificates
 
-
-      - name: Sync kernel repo
+      - name: Sync kernel repo (Pixel 6 raviole 5.10 Android 14)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p android-kernel
           cd android-kernel
           repo init -u https://android.googlesource.com/kernel/manifest -b android-gs-raviole-5.10-android14
-          repo sync -c --no-tags -j1 --fail-fast --force-sync --no-clone-bundle
+          repo sync -c --no-tags -j4 --fail-fast --force-sync --no-clone-bundle
 
       - name: Force-enable BT USB (ASUS BT500) in defconfig
         shell: bash
@@ -62,20 +60,18 @@ jobs:
           echo "[+] Using defconfig: ${DEF}"
           cp -av "${DEF}" "${DEF}.bak"
 
-          # Ensure Bluetooth core + USB HCI dongle support (btusb)
           grep -q '^CONFIG_BT=' "${DEF}" || echo 'CONFIG_BT=y' >> "${DEF}"
           grep -q '^CONFIG_BT_HCI=' "${DEF}" || echo 'CONFIG_BT_HCI=y' >> "${DEF}"
           grep -q '^CONFIG_BT_RFCOMM=' "${DEF}" || echo 'CONFIG_BT_RFCOMM=y' >> "${DEF}"
           grep -q '^CONFIG_BT_HCIBTUSB=' "${DEF}" || echo 'CONFIG_BT_HCIBTUSB=y' >> "${DEF}"
 
-          # Ensure USB stack basics are on (usually already)
           grep -q '^CONFIG_USB=' "${DEF}" || echo 'CONFIG_USB=y' >> "${DEF}"
           grep -q '^CONFIG_USB_SUPPORT=' "${DEF}" || echo 'CONFIG_USB_SUPPORT=y' >> "${DEF}"
 
           echo "----- tail ${DEF} -----"
           tail -n 60 "${DEF}"
 
-      - name: Update vendor ramdisk (through curl)
+      - name: Update vendor ramdisk (from factory zip)
         shell: bash
         run: |
           set -euo pipefail
@@ -88,23 +84,27 @@ jobs:
           mv vendor_boot.img ..
           cd ..
 
-          ls -lah
-          pwd
-
           android-kernel/tools/mkbootimg/unpack_bootimg.py --boot_img vendor_boot.img --out vendor_boot_out
 
-          # Replace the vendor ramdisk artifact used by the build system
+          rm -f android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img || true
           cp -av vendor_boot_out/vendor-ramdisk-by-name/ramdisk_ \
             android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
 
-      - name: Compile Kernel
+      - name: Compile Kernel (build_slider.sh) + fix __isoc23_* host link errors
         shell: bash
         run: |
           set -euo pipefail
           set -x
           cd android-kernel
-          BUILD_AOSP_KERNEL=1 ./build_slider.sh 2>&1 | tee /tmp/build.log
 
+          # Prevent C23 headers mapping strtol->__isoc23_strtol for host tools (resolve_btfids)
+          export HOSTCC=gcc
+          export HOSTCXX=g++
+          export HOSTLD=ld.bfd
+          export HOSTCFLAGS="-std=gnu11"
+          export HOSTCXXFLAGS="-std=gnu++17"
+
+          BUILD_AOSP_KERNEL=1 ./build_slider.sh 2>&1 | tee /tmp/build.log
 
       - name: Pack images to upload
         shell: bash
@@ -117,18 +117,10 @@ jobs:
           cp -av android-kernel/out/slider/dist/vendor_boot.img images/
           cp -av android-kernel/out/slider/dist/vendor_dlkm.img images/
 
-          cp -av flash-all.sh images/
-          cp -av flash-all.bat images/
+          cp -av flash-all.sh images/ || true
+          cp -av flash-all.bat images/ || true
 
           zip -r images.zip images
-
-      - name: Storage Check
-        shell: bash
-        run: |
-          set -euo pipefail
-          df -h
-          cd android-kernel
-          du -sh . || true
 
       - name: Upload files
         uses: actions/upload-artifact@v4
