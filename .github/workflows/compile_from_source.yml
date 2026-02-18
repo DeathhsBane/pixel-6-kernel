@@ -77,19 +77,42 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Download factory image
           curl -fL -o factory.zip "${FACTORY_ZIP_URL}"
           unzip -q factory.zip
 
+          # Extract vendor_boot.img
           cd "${FACTORY_IMAGE}"
           unzip -q "image-${FACTORY_IMAGE}.zip" vendor_boot.img
           mv vendor_boot.img ..
           cd ..
 
+          # Unpack vendor_boot.img to get vendor ramdisk payload
           android-kernel/tools/mkbootimg/unpack_bootimg.py --boot_img vendor_boot.img --out vendor_boot_out
 
-          rm -f android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img || true
-          cp -av vendor_boot_out/vendor-ramdisk-by-name/ramdisk_ \
-            android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
+          RAMDISK_SRC="vendor_boot_out/vendor-ramdisk-by-name/ramdisk_"
+          if [ ! -f "${RAMDISK_SRC}" ]; then
+            echo "ERROR: vendor ramdisk not found at ${RAMDISK_SRC}" >&2
+            find vendor_boot_out -maxdepth 4 -type f | head -n 200
+            exit 1
+          fi
+
+          # Put the ramdisk where different scripts expect it
+          mkdir -p android-kernel/prebuilts/boot-artifacts/ramdisks
+          mkdir -p android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk
+
+          cp -av "${RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
+          cp -av "${RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/oriole.img || true
+          cp -av "${RAMDISK_SRC}" android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk/oriole.img || true
+
+          ls -lah android-kernel/prebuilts/boot-artifacts/ramdisks || true
+
+      - name: Sanity check vendor ramdisk exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lah android-kernel/prebuilts/boot-artifacts/ramdisks || true
+          test -f android-kernel/prebuilts/boot-artifacts/ramdisks/vendor_ramdisk-oriole.img
 
       - name: Compile Kernel (build_slider.sh) + fix __isoc23_* host link errors
         shell: bash
