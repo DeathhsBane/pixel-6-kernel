@@ -187,4 +187,74 @@ jobs:
           chmod +x buildozer
           
           echo "Patching BUILD.bazel to allow compiled Bluetooth modules in the output zip..."
-          ./buildozer 'add module_outs drivers
+          ./buildozer "add module_outs drivers/bluetooth/btintel.ko" //common:kernel_aarch64 || true
+          ./buildozer "add module_outs drivers/bluetooth/btusb.ko" //common:kernel_aarch64 || true
+          ./buildozer "add module_outs drivers/bluetooth/btrtl.ko" //common:kernel_aarch64 || true
+          echo "Buildozer patch applied successfully."
+
+      - name: Build dist (Kleaf / Bazel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
+
+          if [ ! -x "./tools/bazel" ]; then
+            echo "ERROR: ./tools/bazel not found or not executable (bad sync/branch?)" >&2
+            /usr/bin/find . -maxdepth 3 -type f -name bazel -print || true
+            exit 1
+          fi
+
+          # Avoid stale bazel output poisoning builds
+          rm -rf out/bazel || true
+          export BAZEL_OUTPUT_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
+          mkdir -p "${GITHUB_WORKSPACE}/${DIST_DIR}"
+
+          # Prefer the known-good target; fallback by parsing BUILD.bazel for a *_dist target
+          TARGET="//common:kernel_aarch64_dist"
+          if ! ./tools/bazel query "${TARGET}" >/dev/null 2>&1; then
+            echo "Default target not found; discovering a *_dist target in common/BUILD.bazel..."
+            TARGET_NAME="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          b = Path("common/BUILD.bazel").read_text(errors="ignore")
+          # try to find an aarch64 dist first
+          m = re.search(r'name\s*=\s*"(kernel_aarch64[^"]*_dist)"', b)
+          if m:
+              print(m.group(1))
+              raise SystemExit(0)
+          # otherwise any dist
+          m = re.search(r'name\s*=\s*"([^"]*_dist)"', b)
+          if m:
+              print(m.group(1))
+              raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            )" || true
+
+            if [ -z "${TARGET_NAME:-}" ]; then
+              echo "ERROR: could not find any *_dist target in common/BUILD.bazel" >&2
+              exit 1
+            fi
+
+            TARGET="//common:${TARGET_NAME}"
+          fi
+
+          echo "Using dist target: ${TARGET}"
+
+          ./tools/bazel run "${TARGET}" -- \
+            --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+          echo "Dist files:"
+          /usr/bin/find "${GITHUB_WORKSPACE}/${DIST_DIR}" -maxdepth 2 -type f -print || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ env.DEVICE }}
+          path: |
+            dist/**
+            build.log
+          if-no-files-found: warn
