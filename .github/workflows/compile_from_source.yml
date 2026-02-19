@@ -94,7 +94,7 @@ jobs:
             --optimized-fetch \
             --prune
 
-      - name: Patch gki_defconfig (idempotent)
+      - name: Patch gki_defconfig (make it match savedefconfig)
         shell: bash
         run: |
           set -euo pipefail
@@ -107,21 +107,35 @@ jobs:
           fi
           echo "Using defconfig: ${DEFCONFIG_PATH}"
 
-          ensure() {
-            local key="$1" val="$2" f="$3"
-            if grep -qE "^${key}=" "$f"; then
-              sed -i "s/^${key}=.*/${key}=${val}/" "$f"
-            else
-              printf '%s=%s\n' "$key" "$val" >> "$f"
-            fi
-          }
+          # Remove ONLY the lines that were causing the savedefconfig mismatch (if present).
+          sed -i -E \
+            -e '/^CONFIG_BT_HCI=y$/d' \
+            -e '/^CONFIG_BT_HCIBTUSB=y$/d' \
+            -e '/^CONFIG_USB=y$/d' \
+            -e '/^CONFIG_USB_SUPPORT=y$/d' \
+            "${DEFCONFIG_PATH}"
 
-          ensure CONFIG_BT_HCI y "${DEFCONFIG_PATH}"
-          ensure CONFIG_BT_HCIBTUSB y "${DEFCONFIG_PATH}"
-          ensure CONFIG_USB y "${DEFCONFIG_PATH}"
-          ensure CONFIG_USB_SUPPORT y "${DEFCONFIG_PATH}"
+          # Ensure BT USB HCI driver is built as a module (this is what Kleaf is normalizing to).
+          if grep -qE '^CONFIG_BT_HCIBTUSB=' "${DEFCONFIG_PATH}"; then
+            sed -i -E 's/^CONFIG_BT_HCIBTUSB=.*/CONFIG_BT_HCIBTUSB=m/' "${DEFCONFIG_PATH}"
+          else
+            # Insert in the canonical spot (right after BT_HIDP) to match savedefconfig ordering.
+            awk '
+              BEGIN { inserted=0 }
+              { print }
+              /^CONFIG_BT_HIDP=/ && inserted==0 {
+                print "CONFIG_BT_HCIBTUSB=m"
+                inserted=1
+              }
+              END {
+                if (inserted==0) print "CONFIG_BT_HCIBTUSB=m"
+              }
+            ' "${DEFCONFIG_PATH}" > "${DEFCONFIG_PATH}.tmp"
+            mv "${DEFCONFIG_PATH}.tmp" "${DEFCONFIG_PATH}"
+          fi
 
-          tail -n 40 "${DEFCONFIG_PATH}"
+          echo "Patched BT section preview:"
+          grep -nE 'CONFIG_BT_HIDP=|CONFIG_BT_HCIBTUSB=' "${DEFCONFIG_PATH}" || true
 
       - name: Prepare vendor ramdisk symlinks (optional; never fail)
         shell: bash
@@ -157,43 +171,11 @@ jobs:
             exit 1
           fi
 
-          # IMPORTANT: keep Bazel outputs OUTSIDE the repo workspace
           BAZEL_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
           BAZEL="./tools/bazel --output_user_root=${BAZEL_USER_ROOT}"
-
           echo "Using Bazel output_user_root: ${BAZEL_USER_ROOT}"
 
-          # Prefer known common dist targets; fall back to searching under //common/...
-          pick=""
-
-          for c in \
-            "//common:kernel_aarch64_dist" \
-            "//common:kernel_aarch64_gki_dist" \
-            "//common:kernel_aarch64_gki_debug_dist" \
-            "//common:kernel_aarch64_gki_kasan_dist" \
-            "//common:kernel_aarch64_gki_kprobes_dist"
-          do
-            if ${BAZEL} query "${c}" >/dev/null 2>&1; then
-              pick="${c}"
-              break
-            fi
-          done
-
-          if [ -z "${pick}" ]; then
-            echo "Listing *_dist under //common/... (this repo has no //private/gs-google)..."
-            ${BAZEL} query 'attr(name, ".*_dist$", //common/...)' | tee "${GITHUB_WORKSPACE}/dist_targets.txt"
-            # Prefer aarch64 if present
-            pick="$(grep -E 'aarch64.*_dist$' "${GITHUB_WORKSPACE}/dist_targets.txt" | head -n 1 || true)"
-            if [ -z "${pick}" ]; then
-              pick="$(head -n 1 "${GITHUB_WORKSPACE}/dist_targets.txt" || true)"
-            fi
-          fi
-
-          if [ -z "${pick}" ]; then
-            echo "ERROR: no *_dist targets found under //common/..." >&2
-            exit 1
-          fi
-
+          pick="//common:kernel_aarch64_dist"
           echo "Chosen dist target: ${pick}"
           echo "${pick}" > "${GITHUB_WORKSPACE}/chosen_dist_target.txt"
 
@@ -206,17 +188,10 @@ jobs:
           set -euo pipefail
           mkdir -p "${GITHUB_WORKSPACE}/dist"
 
-          echo "Searching for dist directories..."
           mapfile -t dists < <(find "${GITHUB_WORKSPACE}/android-kernel" -maxdepth 8 -type d -name dist 2>/dev/null || true)
-
-          if [ "${#dists[@]}" -eq 0 ]; then
-            echo "No dist directories found."
-          else
-            for d in "${dists[@]}"; do
-              echo "Copying: ${d}"
-              rsync -a "${d}/." "${GITHUB_WORKSPACE}/dist/" || true
-            done
-          fi
+          for d in "${dists[@]}"; do
+            rsync -a "${d}/." "${GITHUB_WORKSPACE}/dist/" || true
+          done
 
           echo "dist contents:"
           /usr/bin/ls -al "${GITHUB_WORKSPACE}/dist" || true
@@ -229,6 +204,5 @@ jobs:
           path: |
             dist/**
             build.log
-            dist_targets.txt
             chosen_dist_target.txt
           if-no-files-found: warn
