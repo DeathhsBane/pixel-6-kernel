@@ -54,21 +54,20 @@ jobs:
             unzip \
             xz-utils \
             zstd \
-            zip \
             binutils \
-            binutils-dev \
-            openjdk-17-jdk-headless
+            binutils-dev
 
           sudo install -d -m 0755 /usr/local/bin
           sudo curl -fsSL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo + ccache
+      - name: Cache repo + out + ccache
         uses: actions/cache@v4
         with:
           path: |
             android-kernel/.repo
+            android-kernel/out
             .ccache
           key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
           restore-keys: |
@@ -94,67 +93,119 @@ jobs:
             --optimized-fetch \
             --prune
 
-      - name: Patch gki_defconfig (make it match savedefconfig)
+      - name: Patch gki_defconfig (savedefconfig-friendly)
         shell: bash
         run: |
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}/android-kernel"
 
-          DEFCONFIG_PATH="$(find ./common -type f -path '*/arch/arm64/configs/gki_defconfig' -print -quit)"
-          if [ -z "${DEFCONFIG_PATH}" ]; then
-            echo "ERROR: gki_defconfig not found under ./common" >&2
-            exit 1
-          fi
-          echo "Using defconfig: ${DEFCONFIG_PATH}"
+          DEFCONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
+          test -f "${DEFCONFIG_PATH}"
 
-          # Remove ONLY the lines that were causing the savedefconfig mismatch (if present).
-          sed -i -E \
-            -e '/^CONFIG_BT_HCI=y$/d' \
-            -e '/^CONFIG_BT_HCIBTUSB=y$/d' \
-            -e '/^CONFIG_USB=y$/d' \
-            -e '/^CONFIG_USB_SUPPORT=y$/d' \
-            "${DEFCONFIG_PATH}"
-
-          # Ensure BT USB HCI driver is built as a module (this is what Kleaf is normalizing to).
-          if grep -qE '^CONFIG_BT_HCIBTUSB=' "${DEFCONFIG_PATH}"; then
-            sed -i -E 's/^CONFIG_BT_HCIBTUSB=.*/CONFIG_BT_HCIBTUSB=m/' "${DEFCONFIG_PATH}"
+          # Kleaf/savedefconfig expects this as a module and in the sorted section
+          if grep -q '^CONFIG_BT_HCIBTUSB=' "${DEFCONFIG_PATH}"; then
+            sed -i 's/^CONFIG_BT_HCIBTUSB=.*/CONFIG_BT_HCIBTUSB=m/' "${DEFCONFIG_PATH}"
           else
-            # Insert in the canonical spot (right after BT_HIDP) to match savedefconfig ordering.
-            awk '
-              BEGIN { inserted=0 }
-              { print }
-              /^CONFIG_BT_HIDP=/ && inserted==0 {
-                print "CONFIG_BT_HCIBTUSB=m"
-                inserted=1
-              }
-              END {
-                if (inserted==0) print "CONFIG_BT_HCIBTUSB=m"
-              }
-            ' "${DEFCONFIG_PATH}" > "${DEFCONFIG_PATH}.tmp"
-            mv "${DEFCONFIG_PATH}.tmp" "${DEFCONFIG_PATH}"
+            # Insert where savedefconfig places it (right after BT_HIDP)
+            if grep -q '^CONFIG_BT_HIDP=m$' "${DEFCONFIG_PATH}"; then
+              sed -i '/^CONFIG_BT_HIDP=m$/a CONFIG_BT_HCIBTUSB=m' "${DEFCONFIG_PATH}"
+            else
+              # Fallback (shouldn't happen, but won't break YAML)
+              echo 'CONFIG_BT_HCIBTUSB=m' >> "${DEFCONFIG_PATH}"
+            fi
           fi
 
-          echo "Patched BT section preview:"
-          grep -nE 'CONFIG_BT_HIDP=|CONFIG_BT_HCIBTUSB=' "${DEFCONFIG_PATH}" || true
+          echo "Defconfig snippet:"
+          grep -n -E '^CONFIG_BT_(HIDP|HCIBTUSB)=' "${DEFCONFIG_PATH}" || true
 
-      - name: Prepare vendor ramdisk symlinks (optional; never fail)
+      - name: Patch Kleaf module_outs for btusb modules
         shell: bash
         run: |
           set -euo pipefail
+          cd "${GITHUB_WORKSPACE}/android-kernel"
 
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("common/BUILD.bazel")
+          s = p.read_text()
+
+          anchor = 'name = "kernel_aarch64"'
+          i = s.find(anchor)
+          if i == -1:
+            raise SystemExit("ERROR: kernel_aarch64 target not found in common/BUILD.bazel")
+
+          mo = s.find("module_outs", i)
+          if mo == -1:
+            raise SystemExit("ERROR: module_outs not found under kernel_aarch64 (unexpected for your tree)")
+
+          lb = s.find("[", mo)
+          if lb == -1:
+            raise SystemExit("ERROR: module_outs list '[' not found")
+
+          depth = 0
+          rb = None
+          for k in range(lb, len(s)):
+            if s[k] == "[":
+              depth += 1
+            elif s[k] == "]":
+              depth -= 1
+              if depth == 0:
+                rb = k
+                break
+          if rb is None:
+            raise SystemExit("ERROR: could not find end of module_outs list")
+
+          block = s[lb+1:rb]
+          want = [
+            "drivers/bluetooth/btusb.ko",
+            "drivers/bluetooth/btrtl.ko",
+            "drivers/bluetooth/btintel.ko",
+          ]
+
+          # Detect indentation from existing entries
+          import re
+          m = re.search(r"\n(\s*)\"", block)
+          indent = m.group(1) if m else "    "
+
+          missing = [w for w in want if (f'"{w}"' not in block)]
+          if not missing:
+            print("module_outs already contains btusb/btrtl/btintel")
+            raise SystemExit(0)
+
+          insert = "".join([f'\n{indent}"{w}",' for w in missing])
+          new_block = block.rstrip() + insert + "\n"
+          s2 = s[:lb+1] + new_block + s[rb:]
+
+          p.write_text(s2)
+          print("Added to module_outs:", ", ".join(missing))
+          PY
+
+          echo "Patched lines (grep):"
+          grep -n -E 'btusb\.ko|btrtl\.ko|btintel\.ko' common/BUILD.bazel || true
+
+      - name: Prepare vendor ramdisk symlinks (optional, keeps your tree happy)
+        shell: bash
+        run: |
+          set -euo pipefail
           RAMDISK_DIR="${GITHUB_WORKSPACE}/android-kernel/prebuilts/boot-artifacts/ramdisks"
           mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
 
           if [ -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
             cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-            ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
-            ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+          elif [ -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img" ]; then
+            echo "Using existing ${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
+          else
+            echo "WARN: vendor_ramdisk00 not present; continuing (not required for //common dist)"
           fi
+
+          ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
+          ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img" || true
 
           /usr/bin/ls -al "${RAMDISK_DIR}" || true
           /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk" || true
 
-      - name: Build with Kleaf (public targets only)
+      - name: Build dist (Kleaf Bazel)
         shell: bash
         run: |
           set -euo pipefail
@@ -165,36 +216,20 @@ jobs:
           export USE_CCACHE=1
           export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
 
-          if [ ! -x "./tools/bazel" ]; then
-            echo "ERROR: tools/bazel not found or not executable." >&2
-            /usr/bin/ls -al ./tools >&2 || true
+          rm -rf "${GITHUB_WORKSPACE}/dist"
+          mkdir -p "${GITHUB_WORKSPACE}/dist"
+
+          # Use a temp output_user_root to avoid weird cached toolchain states
+          export BAZEL_OUTPUT_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
+
+          if [ -x "./tools/bazel" ]; then
+            BAZEL="./tools/bazel"
+          else
+            echo "ERROR: ./tools/bazel not found/executable" >&2
             exit 1
           fi
 
-          BAZEL_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
-          BAZEL="./tools/bazel --output_user_root=${BAZEL_USER_ROOT}"
-          echo "Using Bazel output_user_root: ${BAZEL_USER_ROOT}"
-
-          pick="//common:kernel_aarch64_dist"
-          echo "Chosen dist target: ${pick}"
-          echo "${pick}" > "${GITHUB_WORKSPACE}/chosen_dist_target.txt"
-
-          ${BAZEL} run "${pick}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
-
-      - name: Collect dist output
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "${GITHUB_WORKSPACE}/dist"
-
-          mapfile -t dists < <(find "${GITHUB_WORKSPACE}/android-kernel" -maxdepth 8 -type d -name dist 2>/dev/null || true)
-          for d in "${dists[@]}"; do
-            rsync -a "${d}/." "${GITHUB_WORKSPACE}/dist/" || true
-          done
-
-          echo "dist contents:"
-          /usr/bin/ls -al "${GITHUB_WORKSPACE}/dist" || true
+          "${BAZEL}" run //common:kernel_aarch64_dist -- --dist_dir="${GITHUB_WORKSPACE}/dist" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
 
       - name: Upload artifacts
         if: always()
@@ -204,5 +239,4 @@ jobs:
           path: |
             dist/**
             build.log
-            chosen_dist_target.txt
           if-no-files-found: warn
