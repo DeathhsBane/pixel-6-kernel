@@ -64,12 +64,11 @@ jobs:
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo + out + ccache
+      - name: Cache repo + ccache
         uses: actions/cache@v4
         with:
           path: |
             android-kernel/.repo
-            android-kernel/out
             .ccache
           key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
           restore-keys: |
@@ -124,7 +123,7 @@ jobs:
 
           tail -n 40 "${DEFCONFIG_PATH}"
 
-      - name: Prepare vendor ramdisk symlinks
+      - name: Prepare vendor ramdisk symlinks (optional; never fail)
         shell: bash
         run: |
           set -euo pipefail
@@ -134,20 +133,14 @@ jobs:
 
           if [ -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
             cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-          elif [ -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img" ]; then
-            echo "Using existing ${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-          else
-            echo "ERROR: missing vendor ramdisk source. Put vendor_ramdisk00 at repo root." >&2
-            exit 1
+            ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
+            ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
           fi
 
-          ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
-          ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+          /usr/bin/ls -al "${RAMDISK_DIR}" || true
+          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk" || true
 
-          /usr/bin/ls -al "${RAMDISK_DIR}"
-          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
-
-      - name: Build with Kleaf (Bazel output outside workspace)
+      - name: Build with Kleaf (public targets only)
         shell: bash
         run: |
           set -euo pipefail
@@ -164,27 +157,40 @@ jobs:
             exit 1
           fi
 
+          # IMPORTANT: keep Bazel outputs OUTSIDE the repo workspace
           BAZEL_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
           BAZEL="./tools/bazel --output_user_root=${BAZEL_USER_ROOT}"
 
           echo "Using Bazel output_user_root: ${BAZEL_USER_ROOT}"
 
+          # Prefer known common dist targets; fall back to searching under //common/...
           pick=""
 
-          if ${BAZEL} query "//private/gs-google:slider_dist" >/dev/null 2>&1; then
-            pick="//private/gs-google:slider_dist"
-          elif ${BAZEL} query "//private/gs-google:${DEVICE}_dist" >/dev/null 2>&1; then
-            pick="//private/gs-google:${DEVICE}_dist"
-          else
-            echo "Falling back to listing dist targets in //private/gs-google..."
-            ${BAZEL} query 'attr(name, ".*_dist$", //private/gs-google:all)' | tee "${GITHUB_WORKSPACE}/dist_targets.txt"
-            pick="$(head -n 1 "${GITHUB_WORKSPACE}/dist_targets.txt" || true)"
+          for c in \
+            "//common:kernel_aarch64_dist" \
+            "//common:kernel_aarch64_gki_dist" \
+            "//common:kernel_aarch64_gki_debug_dist" \
+            "//common:kernel_aarch64_gki_kasan_dist" \
+            "//common:kernel_aarch64_gki_kprobes_dist"
+          do
+            if ${BAZEL} query "${c}" >/dev/null 2>&1; then
+              pick="${c}"
+              break
+            fi
+          done
+
+          if [ -z "${pick}" ]; then
+            echo "Listing *_dist under //common/... (this repo has no //private/gs-google)..."
+            ${BAZEL} query 'attr(name, ".*_dist$", //common/...)' | tee "${GITHUB_WORKSPACE}/dist_targets.txt"
+            # Prefer aarch64 if present
+            pick="$(grep -E 'aarch64.*_dist$' "${GITHUB_WORKSPACE}/dist_targets.txt" | head -n 1 || true)"
+            if [ -z "${pick}" ]; then
+              pick="$(head -n 1 "${GITHUB_WORKSPACE}/dist_targets.txt" || true)"
+            fi
           fi
 
           if [ -z "${pick}" ]; then
-            echo "ERROR: Could not find a *_dist target under //private/gs-google." >&2
-            echo "Dumping nearby packages (top-level):" >&2
-            ${BAZEL} query '//private/gs-google:all' 2>/dev/null | head -n 200 || true
+            echo "ERROR: no *_dist targets found under //common/..." >&2
             exit 1
           fi
 
@@ -198,27 +204,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "${GITHUB_WORKSPACE}/dist"
 
-          echo "Searching for out/**/dist directories..."
-          if [ -d "${GITHUB_WORKSPACE}/android-kernel/out" ]; then
-            mapfile -t dists < <(find "${GITHUB_WORKSPACE}/android-kernel/out" -maxdepth 6 -type d -name dist 2>/dev/null || true)
-          else
-            dists=()
-          fi
+          echo "Searching for dist directories..."
+          mapfile -t dists < <(find "${GITHUB_WORKSPACE}/android-kernel" -maxdepth 8 -type d -name dist 2>/dev/null || true)
 
           if [ "${#dists[@]}" -eq 0 ]; then
-            echo "No out/**/dist found. Showing out tree (top):"
-            find "${GITHUB_WORKSPACE}/android-kernel/out" -maxdepth 3 -type d 2>/dev/null || true
+            echo "No dist directories found."
           else
             for d in "${dists[@]}"; do
               echo "Copying: ${d}"
-              rsync -a "${d}/." "${GITHUB_WORKSPACE}/dist/"
+              rsync -a "${d}/." "${GITHUB_WORKSPACE}/dist/" || true
             done
           fi
 
-          echo "dist (top-level) contents:"
+          echo "dist contents:"
           /usr/bin/ls -al "${GITHUB_WORKSPACE}/dist" || true
 
       - name: Upload artifacts
