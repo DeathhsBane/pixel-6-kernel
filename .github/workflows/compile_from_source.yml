@@ -17,11 +17,12 @@ jobs:
       KERNEL_BRANCH: android14-gs-pixel-6.1
       MANIFEST_URL: https://android.googlesource.com/kernel/manifest
 
+      KERNEL_DIR: android-kernel
+      DIST_DIR: dist
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install deps + repo
         shell: bash
@@ -62,23 +63,21 @@ jobs:
           sudo chmod 0755 /usr/local/bin/repo
           /usr/local/bin/repo version
 
-      - name: Cache repo + out + ccache
+      - name: Cache repo (.repo only)
         uses: actions/cache@v4
         with:
           path: |
             android-kernel/.repo
-            android-kernel/out
-            .ccache
-          key: pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
+          key: repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
           restore-keys: |
-            pixel6-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
+            repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
 
       - name: repo init + sync
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${GITHUB_WORKSPACE}/android-kernel"
-          cd "${GITHUB_WORKSPACE}/android-kernel"
+          mkdir -p "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
+          cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
 
           if [ ! -d ".repo" ]; then
             /usr/local/bin/repo init -u "${MANIFEST_URL}" -b "${KERNEL_BRANCH}"
@@ -93,143 +92,146 @@ jobs:
             --optimized-fetch \
             --prune
 
-      - name: Patch gki_defconfig (savedefconfig-friendly)
+      - name: Patch gki_defconfig (savedefconfig-safe)
         shell: bash
         run: |
           set -euo pipefail
-          cd "${GITHUB_WORKSPACE}/android-kernel"
+          cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
 
-          DEFCONFIG_PATH="./common/arch/arm64/configs/gki_defconfig"
-          test -f "${DEFCONFIG_PATH}"
-
-          # Kleaf/savedefconfig expects this as a module and in the sorted section
-          if grep -q '^CONFIG_BT_HCIBTUSB=' "${DEFCONFIG_PATH}"; then
-            sed -i 's/^CONFIG_BT_HCIBTUSB=.*/CONFIG_BT_HCIBTUSB=m/' "${DEFCONFIG_PATH}"
-          else
-            # Insert where savedefconfig places it (right after BT_HIDP)
-            if grep -q '^CONFIG_BT_HIDP=m$' "${DEFCONFIG_PATH}"; then
-              sed -i '/^CONFIG_BT_HIDP=m$/a CONFIG_BT_HCIBTUSB=m' "${DEFCONFIG_PATH}"
-            else
-              # Fallback (shouldn't happen, but won't break YAML)
-              echo 'CONFIG_BT_HCIBTUSB=m' >> "${DEFCONFIG_PATH}"
-            fi
+          DEFCONFIG="common/arch/arm64/configs/gki_defconfig"
+          if [ ! -f "${DEFCONFIG}" ]; then
+            echo "ERROR: missing ${DEFCONFIG}" >&2
+            exit 1
           fi
-
-          echo "Defconfig snippet:"
-          grep -n -E '^CONFIG_BT_(HIDP|HCIBTUSB)=' "${DEFCONFIG_PATH}" || true
-
-      - name: Patch Kleaf module_outs for btusb modules
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${GITHUB_WORKSPACE}/android-kernel"
 
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path("common/BUILD.bazel")
-          s = p.read_text()
+          p = Path("common/arch/arm64/configs/gki_defconfig")
+          lines = p.read_text().splitlines(True)
 
-          anchor = 'name = "kernel_aarch64"'
-          i = s.find(anchor)
-          if i == -1:
-            raise SystemExit("ERROR: kernel_aarch64 target not found in common/BUILD.bazel")
+          # Remove the stuff that keeps breaking savedefconfig comparisons
+          remove_keys = {
+              "CONFIG_BT_HCIBTUSB",
+              "CONFIG_BT_HCI",
+              "CONFIG_USB",
+              "CONFIG_USB_SUPPORT",
+          }
 
-          mo = s.find("module_outs", i)
-          if mo == -1:
-            raise SystemExit("ERROR: module_outs not found under kernel_aarch64 (unexpected for your tree)")
+          cleaned = []
+          for ln in lines:
+              if any(ln.startswith(k + "=") for k in remove_keys):
+                  continue
+              cleaned.append(ln)
 
-          lb = s.find("[", mo)
-          if lb == -1:
-            raise SystemExit("ERROR: module_outs list '[' not found")
+          # Insert BT USB as module right after CONFIG_BT_HIDP=...
+          insert_line = "CONFIG_BT_HCIBTUSB=m\n"
 
-          depth = 0
-          rb = None
-          for k in range(lb, len(s)):
-            if s[k] == "[":
-              depth += 1
-            elif s[k] == "]":
-              depth -= 1
-              if depth == 0:
-                rb = k
-                break
-          if rb is None:
-            raise SystemExit("ERROR: could not find end of module_outs list")
+          idx = None
+          for i, ln in enumerate(cleaned):
+              if ln.startswith("CONFIG_BT_HIDP="):
+                  idx = i + 1
+                  break
 
-          block = s[lb+1:rb]
-          want = [
-            "drivers/bluetooth/btusb.ko",
-            "drivers/bluetooth/btrtl.ko",
-            "drivers/bluetooth/btintel.ko",
-          ]
+          if idx is None:
+              # fallback: after last CONFIG_BT_* line
+              last_bt = None
+              for i, ln in enumerate(cleaned):
+                  if ln.startswith("CONFIG_BT_"):
+                      last_bt = i
+              idx = (last_bt + 1) if last_bt is not None else len(cleaned)
 
-          # Detect indentation from existing entries
-          import re
-          m = re.search(r"\n(\s*)\"", block)
-          indent = m.group(1) if m else "    "
+          cleaned.insert(idx, insert_line)
 
-          missing = [w for w in want if (f'"{w}"' not in block)]
-          if not missing:
-            print("module_outs already contains btusb/btrtl/btintel")
-            raise SystemExit(0)
+          # Ensure trailing newline
+          out = "".join(cleaned)
+          if not out.endswith("\n"):
+              out += "\n"
 
-          insert = "".join([f'\n{indent}"{w}",' for w in missing])
-          new_block = block.rstrip() + insert + "\n"
-          s2 = s[:lb+1] + new_block + s[rb:]
-
-          p.write_text(s2)
-          print("Added to module_outs:", ", ".join(missing))
+          p.write_text(out)
           PY
 
-          echo "Patched lines (grep):"
-          grep -n -E 'btusb\.ko|btrtl\.ko|btintel\.ko' common/BUILD.bazel || true
+          echo "Tail of defconfig:"
+          tail -n 60 "${DEFCONFIG}"
 
-      - name: Prepare vendor ramdisk symlinks (optional, keeps your tree happy)
+      - name: Prepare vendor ramdisk symlinks
         shell: bash
         run: |
           set -euo pipefail
-          RAMDISK_DIR="${GITHUB_WORKSPACE}/android-kernel/prebuilts/boot-artifacts/ramdisks"
+
+          RAMDISK_DIR="${GITHUB_WORKSPACE}/${KERNEL_DIR}/prebuilts/boot-artifacts/ramdisks"
           mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
 
-          if [ -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
-            cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-          elif [ -f "${RAMDISK_DIR}/vendor_ramdisk-oriole.img" ]; then
-            echo "Using existing ${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-          else
-            echo "WARN: vendor_ramdisk00 not present; continuing (not required for //common dist)"
-          fi
-
-          ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
-          ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img" || true
-
-          /usr/bin/ls -al "${RAMDISK_DIR}" || true
-          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk" || true
-
-      - name: Build dist (Kleaf Bazel)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${GITHUB_WORKSPACE}/android-kernel"
-
-          mkdir -p "${GITHUB_WORKSPACE}/.ccache"
-          ccache --set-config=max_size=5.0G
-          export USE_CCACHE=1
-          export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
-
-          rm -rf "${GITHUB_WORKSPACE}/dist"
-          mkdir -p "${GITHUB_WORKSPACE}/dist"
-
-          # Use a temp output_user_root to avoid weird cached toolchain states
-          export BAZEL_OUTPUT_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
-
-          if [ -x "./tools/bazel" ]; then
-            BAZEL="./tools/bazel"
-          else
-            echo "ERROR: ./tools/bazel not found/executable" >&2
+          if [ ! -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
+            echo "ERROR: vendor_ramdisk00 not found at repo root." >&2
+            echo "Put vendor_ramdisk00 in the repo root (next to README.md) and commit it." >&2
             exit 1
           fi
 
-          "${BAZEL}" run //common:kernel_aarch64_dist -- --dist_dir="${GITHUB_WORKSPACE}/dist" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
+
+          ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
+          ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
+
+          /usr/bin/ls -al "${RAMDISK_DIR}"
+          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
+
+      - name: Build dist (Kleaf / Bazel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
+
+          if [ ! -x "./tools/bazel" ]; then
+            echo "ERROR: ./tools/bazel not found or not executable (bad sync/branch?)" >&2
+            /usr/bin/find . -maxdepth 3 -type f -name bazel -print || true
+            exit 1
+          fi
+
+          # Avoid stale bazel output poisoning builds
+          rm -rf out/bazel || true
+          export BAZEL_OUTPUT_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
+          mkdir -p "${GITHUB_WORKSPACE}/${DIST_DIR}"
+
+          # Prefer the known-good target; fallback by parsing BUILD.bazel for a *_dist target
+          TARGET="//common:kernel_aarch64_dist"
+          if ! ./tools/bazel query "${TARGET}" >/dev/null 2>&1; then
+            echo "Default target not found; discovering a *_dist target in common/BUILD.bazel..."
+            TARGET_NAME="$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          b = Path("common/BUILD.bazel").read_text(errors="ignore")
+          # try to find an aarch64 dist first
+          m = re.search(r'name\s*=\s*"(kernel_aarch64[^"]*_dist)"', b)
+          if m:
+              print(m.group(1))
+              raise SystemExit(0)
+          # otherwise any dist
+          m = re.search(r'name\s*=\s*"([^"]*_dist)"', b)
+          if m:
+              print(m.group(1))
+              raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+            )" || true
+
+            if [ -z "${TARGET_NAME:-}" ]; then
+              echo "ERROR: could not find any *_dist target in common/BUILD.bazel" >&2
+              exit 1
+            fi
+
+            TARGET="//common:${TARGET_NAME}"
+          fi
+
+          echo "Using dist target: ${TARGET}"
+
+          ./tools/bazel run "${TARGET}" -- \
+            --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}" \
+            2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+
+          echo "Dist files:"
+          /usr/bin/find "${GITHUB_WORKSPACE}/${DIST_DIR}" -maxdepth 2 -type f -print || true
 
       - name: Upload artifacts
         if: always()
