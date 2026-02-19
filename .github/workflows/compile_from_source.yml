@@ -30,44 +30,16 @@ jobs:
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            ca-certificates \
-            ccache \
-            clang \
-            cpio \
-            curl \
-            file \
-            flex \
-            git \
-            lld \
-            llvm \
-            libelf-dev \
-            make \
-            ninja-build \
-            openssl \
-            pahole \
-            pkg-config \
-            python3 \
-            python3-pip \
-            rsync \
-            unzip \
-            xz-utils \
-            zstd \
-            binutils \
-            binutils-dev
-
+            bc bison build-essential ca-certificates ccache clang cpio curl file flex git lld llvm libelf-dev make ninja-build openssl pahole pkg-config python3 python3-pip rsync unzip xz-utils zstd binutils binutils-dev
+          
           sudo install -d -m 0755 /usr/local/bin
           sudo curl -fsSL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
           sudo chmod 0755 /usr/local/bin/repo
-          /usr/local/bin/repo version
 
       - name: Cache repo (.repo only)
         uses: actions/cache@v4
         with:
-          path: |
-            android-kernel/.repo
+          path: android-kernel/.repo
           key: repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-${{ hashFiles('.github/workflows/compile_from_source.yml') }}
           restore-keys: |
             repo-${{ runner.os }}-${{ env.KERNEL_BRANCH }}-
@@ -83,171 +55,86 @@ jobs:
             /usr/local/bin/repo init -u "${MANIFEST_URL}" -b "${KERNEL_BRANCH}"
           fi
 
-          /usr/local/bin/repo sync \
-            -c \
-            -j"$(nproc)" \
-            --force-sync \
-            --no-clone-bundle \
-            --no-tags \
-            --optimized-fetch \
-            --prune
+          /usr/local/bin/repo sync -c -j"$(nproc)" --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune
 
-      - name: Patch gki_defconfig (savedefconfig-safe)
+      - name: Patch gki_defconfig
         shell: bash
         run: |
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
-
+          
           DEFCONFIG="common/arch/arm64/configs/gki_defconfig"
-          if [ ! -f "${DEFCONFIG}" ]; then
-            echo "ERROR: missing ${DEFCONFIG}" >&2
-            exit 1
-          fi
-
+          
           python3 - <<'PY'
           from pathlib import Path
-
           p = Path("common/arch/arm64/configs/gki_defconfig")
           lines = p.read_text().splitlines(True)
-
-          # Remove the stuff that keeps breaking savedefconfig comparisons
-          remove_keys = {
-              "CONFIG_BT_HCIBTUSB",
-              "CONFIG_BT_HCI",
-              "CONFIG_USB",
-              "CONFIG_USB_SUPPORT",
-          }
-
-          cleaned = []
-          for ln in lines:
-              if any(ln.startswith(k + "=") for k in remove_keys):
-                  continue
-              cleaned.append(ln)
-
-          # Insert BT USB as module right after CONFIG_BT_HIDP=...
+          
+          remove_keys = {"CONFIG_BT_HCIBTUSB", "CONFIG_BT_HCI", "CONFIG_USB", "CONFIG_USB_SUPPORT"}
+          cleaned = [ln for ln in lines if not any(ln.startswith(k + "=") for k in remove_keys)]
+          
           insert_line = "CONFIG_BT_HCIBTUSB=m\n"
-
-          idx = None
-          for i, ln in enumerate(cleaned):
-              if ln.startswith("CONFIG_BT_HIDP="):
-                  idx = i + 1
-                  break
-
+          
+          idx = next((i + 1 for i, ln in enumerate(cleaned) if ln.startswith("CONFIG_BT_HIDP=")), None)
           if idx is None:
-              # fallback: after last CONFIG_BT_* line
-              last_bt = None
-              for i, ln in enumerate(cleaned):
-                  if ln.startswith("CONFIG_BT_"):
-                      last_bt = i
+              last_bt = next((i for i, ln in reversed(list(enumerate(cleaned))) if ln.startswith("CONFIG_BT_")), None)
               idx = (last_bt + 1) if last_bt is not None else len(cleaned)
-
+          
           cleaned.insert(idx, insert_line)
-
-          # Ensure trailing newline
           out = "".join(cleaned)
-          if not out.endswith("\n"):
-              out += "\n"
-
+          if not out.endswith("\n"): out += "\n"
           p.write_text(out)
           PY
-
-          echo "Tail of defconfig:"
-          tail -n 60 "${DEFCONFIG}"
 
       - name: Prepare vendor ramdisk symlinks
         shell: bash
         run: |
           set -euo pipefail
-
           RAMDISK_DIR="${GITHUB_WORKSPACE}/${KERNEL_DIR}/prebuilts/boot-artifacts/ramdisks"
           mkdir -p "${RAMDISK_DIR}/vendor_ramdisk"
-
-          if [ ! -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" ]; then
-            echo "ERROR: vendor_ramdisk00 not found at repo root." >&2
-            echo "Put vendor_ramdisk00 in the repo root (next to README.md) and commit it." >&2
-            exit 1
-          fi
-
           cp -f "${GITHUB_WORKSPACE}/vendor_ramdisk00" "${RAMDISK_DIR}/vendor_ramdisk-oriole.img"
-
           ln -sf "vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/oriole.img"
           ln -sf "../vendor_ramdisk-oriole.img" "${RAMDISK_DIR}/vendor_ramdisk/oriole.img"
-
-          /usr/bin/ls -al "${RAMDISK_DIR}"
-          /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
 
       - name: Patch Bazel module export list
         shell: bash
         run: |
           set -euo pipefail
-          cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
+          cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}/common"
           
-          echo "Downloading buildozer to bypass Bazel restrictions..."
-          curl -sSL -o buildozer https://github.com/bazelbuild/buildtools/releases/download/v7.1.2/buildozer-linux-amd64
-          chmod +x buildozer
+          echo "Bypassing Buildozer. Force-injecting modules into BUILD.bazel via Python..."
+          python3 - <<'PY'
+          import re
+          with open("BUILD.bazel", "r") as f:
+              content = f.read()
           
-          echo "Patching BUILD.bazel to allow compiled Bluetooth modules in the output zip..."
-          ./buildozer "add module_outs drivers/bluetooth/btintel.ko" //common:kernel_aarch64 || true
-          ./buildozer "add module_outs drivers/bluetooth/btusb.ko" //common:kernel_aarch64 || true
-          ./buildozer "add module_outs drivers/bluetooth/btrtl.ko" //common:kernel_aarch64 || true
-          echo "Buildozer patch applied successfully."
+          # Safely inject the required Realtek/USB modules into every module_outs array
+          replacement = "\\1\n    \"drivers/bluetooth/btintel.ko\",\n    \"drivers/bluetooth/btusb.ko\",\n    \"drivers/bluetooth/btrtl.ko\","
+          patched = re.sub(r"(module_outs\s*=\s*\[)", replacement, content)
+          
+          with open("BUILD.bazel", "w") as f:
+              f.write(patched)
+          PY
+          echo "Raw text patch applied successfully."
 
       - name: Build dist (Kleaf / Bazel)
         shell: bash
         run: |
           set -euo pipefail
           cd "${GITHUB_WORKSPACE}/${KERNEL_DIR}"
-
-          if [ ! -x "./tools/bazel" ]; then
-            echo "ERROR: ./tools/bazel not found or not executable (bad sync/branch?)" >&2
-            /usr/bin/find . -maxdepth 3 -type f -name bazel -print || true
-            exit 1
-          fi
-
-          # Avoid stale bazel output poisoning builds
           rm -rf out/bazel || true
           export BAZEL_OUTPUT_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
           mkdir -p "${GITHUB_WORKSPACE}/${DIST_DIR}"
 
-          # Prefer the known-good target; fallback by parsing BUILD.bazel for a *_dist target
-          TARGET="//common:kernel_aarch64_dist"
-          if ! ./tools/bazel query "${TARGET}" >/dev/null 2>&1; then
-            echo "Default target not found; discovering a *_dist target in common/BUILD.bazel..."
-            TARGET_NAME="$(python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          b = Path("common/BUILD.bazel").read_text(errors="ignore")
-          # try to find an aarch64 dist first
-          m = re.search(r'name\s*=\s*"(kernel_aarch64[^"]*_dist)"', b)
-          if m:
-              print(m.group(1))
-              raise SystemExit(0)
-          # otherwise any dist
-          m = re.search(r'name\s*=\s*"([^"]*_dist)"', b)
-          if m:
-              print(m.group(1))
-              raise SystemExit(0)
-          raise SystemExit(1)
-          PY
-            )" || true
-
-            if [ -z "${TARGET_NAME:-}" ]; then
-              echo "ERROR: could not find any *_dist target in common/BUILD.bazel" >&2
-              exit 1
-            fi
-
-            TARGET="//common:${TARGET_NAME}"
-          fi
-
-          echo "Using dist target: ${TARGET}"
-
-          ./tools/bazel run "${TARGET}" -- \
-            --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}" \
-            2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
-
-          echo "Dist files:"
-          /usr/bin/find "${GITHUB_WORKSPACE}/${DIST_DIR}" -maxdepth 2 -type f -print || true
+          TARGET="$(python3 -c '
+          import re, sys
+          b = open("common/BUILD.bazel", errors="ignore").read()
+          m = re.search(r"name\s*=\s*\"(kernel_aarch64[^\"]*_dist)\"", b) or re.search(r"name\s*=\s*\"([^\"]*_dist)\"", b)
+          if m: print("//common:" + m.group(1)); sys.exit(0)
+          sys.exit(1)
+          ')" || TARGET="//common:kernel_aarch64_dist"
+          
+          ./tools/bazel run "${TARGET}" -- --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
 
       - name: Upload artifacts
         if: always()
