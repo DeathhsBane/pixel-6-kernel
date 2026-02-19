@@ -147,7 +147,7 @@ jobs:
           /usr/bin/ls -al "${RAMDISK_DIR}"
           /usr/bin/ls -al "${RAMDISK_DIR}/vendor_ramdisk"
 
-      - name: Build with Kleaf (auto-pick *_dist target)
+      - name: Build with Kleaf (Bazel output outside workspace)
         shell: bash
         run: |
           set -euo pipefail
@@ -159,36 +159,39 @@ jobs:
           export CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
 
           if [ ! -x "./tools/bazel" ]; then
-            echo "ERROR: tools/bazel not found or not executable. Listing ./tools:" >&2
+            echo "ERROR: tools/bazel not found or not executable." >&2
             /usr/bin/ls -al ./tools >&2 || true
             exit 1
           fi
 
-          echo "Querying dist targets..."
-          ./tools/bazel query 'attr(name, ".*_dist$", //...:all)' | tee "${GITHUB_WORKSPACE}/dist_targets.txt"
+          BAZEL_USER_ROOT="/tmp/bazel_user_root_${GITHUB_RUN_ID}"
+          BAZEL="./tools/bazel --output_user_root=${BAZEL_USER_ROOT}"
+
+          echo "Using Bazel output_user_root: ${BAZEL_USER_ROOT}"
 
           pick=""
-          if grep -qE '(^|:)slider_dist$' "${GITHUB_WORKSPACE}/dist_targets.txt"; then
-            pick="$(grep -E '(^//|^@|^)?.*:slider_dist$' "${GITHUB_WORKSPACE}/dist_targets.txt" | head -n 1)"
-          fi
 
-          if [ -z "$pick" ] && grep -qE "(^|:)${DEVICE}_dist$" "${GITHUB_WORKSPACE}/dist_targets.txt"; then
-            pick="$(grep -E ".*:${DEVICE}_dist$" "${GITHUB_WORKSPACE}/dist_targets.txt" | head -n 1)"
-          fi
-
-          if [ -z "$pick" ]; then
+          if ${BAZEL} query "//private/gs-google:slider_dist" >/dev/null 2>&1; then
+            pick="//private/gs-google:slider_dist"
+          elif ${BAZEL} query "//private/gs-google:${DEVICE}_dist" >/dev/null 2>&1; then
+            pick="//private/gs-google:${DEVICE}_dist"
+          else
+            echo "Falling back to listing dist targets in //private/gs-google..."
+            ${BAZEL} query 'attr(name, ".*_dist$", //private/gs-google:all)' | tee "${GITHUB_WORKSPACE}/dist_targets.txt"
             pick="$(head -n 1 "${GITHUB_WORKSPACE}/dist_targets.txt" || true)"
           fi
 
-          if [ -z "$pick" ]; then
-            echo "ERROR: No *_dist targets found in this tree." >&2
+          if [ -z "${pick}" ]; then
+            echo "ERROR: Could not find a *_dist target under //private/gs-google." >&2
+            echo "Dumping nearby packages (top-level):" >&2
+            ${BAZEL} query '//private/gs-google:all' 2>/dev/null | head -n 200 || true
             exit 1
           fi
 
-          echo "Using dist target: $pick"
-          echo "$pick" > "${GITHUB_WORKSPACE}/chosen_dist_target.txt"
+          echo "Chosen dist target: ${pick}"
+          echo "${pick}" > "${GITHUB_WORKSPACE}/chosen_dist_target.txt"
 
-          ./tools/bazel run "$pick" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
+          ${BAZEL} run "${pick}" 2>&1 | tee "${GITHUB_WORKSPACE}/build.log"
 
       - name: Collect dist output
         if: always()
@@ -199,15 +202,19 @@ jobs:
           mkdir -p "${GITHUB_WORKSPACE}/dist"
 
           echo "Searching for out/**/dist directories..."
-          mapfile -t dists < <(find "${GITHUB_WORKSPACE}/android-kernel/out" -maxdepth 4 -type d -name dist 2>/dev/null || true)
+          if [ -d "${GITHUB_WORKSPACE}/android-kernel/out" ]; then
+            mapfile -t dists < <(find "${GITHUB_WORKSPACE}/android-kernel/out" -maxdepth 6 -type d -name dist 2>/dev/null || true)
+          else
+            dists=()
+          fi
 
           if [ "${#dists[@]}" -eq 0 ]; then
             echo "No out/**/dist found. Showing out tree (top):"
             find "${GITHUB_WORKSPACE}/android-kernel/out" -maxdepth 3 -type d 2>/dev/null || true
           else
             for d in "${dists[@]}"; do
-              echo "Copying: $d"
-              rsync -a "$d/." "${GITHUB_WORKSPACE}/dist/"
+              echo "Copying: ${d}"
+              rsync -a "${d}/." "${GITHUB_WORKSPACE}/dist/"
             done
           fi
 
